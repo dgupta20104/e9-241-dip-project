@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Data and outputs (large files)
+data/raw/*
+data/processed/*
+outputs/*
+!**/.gitkeep
+
+# OS
+.DS_Store
