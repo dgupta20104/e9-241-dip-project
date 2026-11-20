@@ -26,7 +26,7 @@ HEIGHT = 1000              # image height after resizing (px)
 BLUR_SIGMA = 1.0           # light Gaussian pre-blur
 STROKE_W = 4               # stroke width at HEIGHT (px), eye-checked
 BLOCK = odd(8 * STROKE_W)  # 33: block ~ 8 x stroke width
-C = 6                      # ~2.5 x blank-paper std (2.4)
+C = 9                      # ~4 x blank-paper std (2.4)
 
 
 # ---- Preprocessing ---------------------------------------------------------
@@ -135,7 +135,7 @@ def estimate_image_params(gray):
         w = STROKE_W
     block = odd(8 * w)
     sigma_n = estimate_noise_sigma(gray, mask, block)
-    c = max(1.0, round(2.5 * sigma_n, 1)) if sigma_n is not None else C
+    c = max(1.0, round(4 * sigma_n, 1)) if sigma_n is not None else C
     return {"stroke_w": w, "sigma_n": sigma_n, "block": block, "C": c, "estimated": True}
 
 
