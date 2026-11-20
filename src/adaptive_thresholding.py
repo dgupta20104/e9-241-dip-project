@@ -89,20 +89,65 @@ def adaptive_mean(gray, block=BLOCK, C=C):
     return np.where(gray < T, 255, 0).astype(np.uint8), T
 
 
-def run_adaptive(img_or_path, height=HEIGHT):
-    """Full finalized process: grayscale -> resize -> blur -> adaptive mean. Returns binary."""
-    binary, _ = adaptive_mean(prepare(img_or_path, height))
+def run_adaptive(img_or_path, height=HEIGHT, estimate_params=False):
+    """Full process: grayscale -> resize -> blur -> adaptive mean.
+
+    estimate_params=False: use the frozen BLOCK / C.
+    estimate_params=True:  estimate block and C for this image (`estimate_image_params`).
+    Returns the binary image (ink = 255).
+    """
+    gray = prepare(img_or_path, height)
+    if estimate_params:
+        p = estimate_image_params(gray)
+        binary, _ = adaptive_mean(gray, p["block"], p["C"])
+    else:
+        binary, _ = adaptive_mean(gray)
     return binary
 
 
-# ---- Parameter tuning (not part of the pipeline) ---------------------------
-def estimate_stroke_width(gray, n_rows=20, n_cols=20, seed=0, return_runs=False):
-    """w = median ink-run length in ~20 random rows/cols of the Otsu mask.
+# ---- Parameter estimation ---------------------------------------------------
+def estimate_noise_sigma(gray, mask, win):
+    """sigma_n = median local std over win x win windows that contain no ink.
 
-    `gray` is the prepared (already blurred) image, so Otsu runs without extra
-    blur and `w` is measured at the adaptive-thresholding scale.
+    Same idea as the std of a hand-picked blank paper patch, done automatically.
+    Use win = block, so sigma_n covers the same variation (noise + shading)
+    that the threshold sees around the local mean. None if no ink-free window.
     """
-    mask, _ = otsu_binarize(gray, blur_ksize=0)
+    mean = local_mean(gray, win)
+    var = local_mean(gray.astype(np.int64) ** 2, win) - mean ** 2
+    blank = local_mean((mask > 0).astype(np.int64), win) == 0
+    if not blank.any():
+        return None
+    return float(np.median(np.sqrt(np.maximum(var[blank], 0))))
+
+
+def estimate_image_params(gray):
+    """Per-image stroke width, noise, block and C.
+
+    A first pass with the frozen parameters gives the ink mask; from it:
+    w = median ink-run length, sigma_n = median std of ink-free windows,
+    block = odd(8 w), C = 2.5 sigma_n. Falls back to frozen values if needed.
+    """
+    mask, _ = adaptive_mean(gray)
+    try:
+        w = estimate_stroke_width(gray, mask=mask)
+    except ValueError:
+        w = STROKE_W
+    block = odd(8 * w)
+    sigma_n = estimate_noise_sigma(gray, mask, block)
+    c = max(1.0, round(2.5 * sigma_n, 1)) if sigma_n is not None else C
+    return {"stroke_w": w, "sigma_n": sigma_n, "block": block, "C": c, "estimated": True}
+
+
+def estimate_stroke_width(gray, mask=None, n_rows=20, n_cols=20, seed=0, return_runs=False):
+    """w = median ink-run length in ~20 random rows/cols of an ink mask.
+
+    mask=None uses the baseline Otsu mask (spec); `gray` is the prepared
+    (already blurred) image, so Otsu runs without extra blur and `w` is
+    measured at the adaptive-thresholding scale.
+    """
+    if mask is None:
+        mask, _ = otsu_binarize(gray, blur_ksize=0)
     rng = np.random.default_rng(seed)
     rows = np.flatnonzero(mask.any(axis=1))
     cols = np.flatnonzero(mask.any(axis=0))
