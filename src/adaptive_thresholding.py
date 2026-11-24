@@ -1,10 +1,21 @@
-"""Step 1b — Adaptive-mean thresholding, written from scratch.
+"""Step 1b — Adaptive (local) Otsu thresholding, written from scratch.
 
-A pixel is ink if  I < local_mean - C,  with the local mean taken over a
-block x block window via an integral image. No morphology.
-Spec: `Claude Chat Memory/Adaptive_Thresholding.md`.
+Otsu's threshold is computed on block x block windows centred on a grid
+(stride = block // 2), using `otsu_threshold` from `src/thresholding.py`,
+and bilinearly interpolated to a per-pixel threshold map T; a pixel is ink
+if  I <= T. Otsu always splits a window in two, so a window counts only if
+its class means differ by >= C and the dark class is a minority
+(<= INK_FRAC_MAX); otherwise (blank paper, shadow edge, texture) the window
+is all paper (threshold = its darkest pixel - 1). No morphology, no global
+cutoff (tested: on phone photos any global T_g that removes false ink also
+removes real writing). Block size and C are estimated per image
+(block = odd(8 w), C = 4 sigma_n).
+Specs: `Claude Chat Memory/Adaptive_Thresholding.md` (written for adaptive mean),
+`Claude Chat Memory/Global_Threshold_Selection.md` (per-tile contrast gate).
 
-Pipeline entry point: `run_adaptive(img_or_path)` -> uint8 binary, ink = 255.
+Pipeline entry point: `run_adaptive(img_or_path, return_params=True)` ->
+(uint8 binary with ink = 255, params incl. stroke width "stroke_w").
+Parameters are always estimated per image.
 """
 
 import math
@@ -12,7 +23,7 @@ import math
 import cv2
 import numpy as np
 
-from src.thresholding import otsu_binarize
+from src.thresholding import otsu_binarize, otsu_threshold
 
 
 def odd(n):
@@ -27,6 +38,7 @@ BLUR_SIGMA = 1.0           # light Gaussian pre-blur
 STROKE_W = 4               # stroke width at HEIGHT (px), eye-checked
 BLOCK = odd(8 * STROKE_W)  # 33: block ~ 8 x stroke width
 C = 9                      # ~4 x blank-paper std (2.4)
+INK_FRAC_MAX = 0.35        # adaptive Otsu: max dark-class fraction of a valid window
 
 
 # ---- Preprocessing ---------------------------------------------------------
@@ -68,7 +80,7 @@ def prepare(img_or_path, height=HEIGHT, blur_sigma=BLUR_SIGMA):
     return gaussian_blur(gray, blur_sigma) if blur_sigma > 0 else gray
 
 
-# ---- Adaptive mean ---------------------------------------------------------
+# ---- Local statistics (integral image; used only for the noise estimate) ----
 def local_mean(gray, block):
     """Box mean over block x block via an int64 integral image (reflect padding)."""
     if block < 3 or block % 2 == 0:
@@ -83,26 +95,85 @@ def local_mean(gray, block):
     return s / (block * block)
 
 
-def adaptive_mean(gray, block=BLOCK, C=C):
-    """Ink where gray < local_mean - C. Returns (binary ink=255, threshold map T)."""
-    T = local_mean(gray, block) - C
-    return np.where(gray < T, 255, 0).astype(np.uint8), T
+# ---- Adaptive Otsu ---------------------------------------------------------
+def tile_centres(n, stride):
+    """Grid centres 0, stride, 2 stride, ... plus the last index n - 1."""
+    c = np.arange(0, n, stride)
+    return c if c[-1] == n - 1 else np.r_[c, n - 1]
 
 
-def run_adaptive(img_or_path, height=HEIGHT, estimate_params=False):
-    """Full process: grayscale -> resize -> blur -> adaptive mean.
+def interp_grid(G, cy, cx, shape):
+    """Bilinear interpolation of grid values G[i, j] at (cy[i], cx[j]) to every pixel."""
+    def weights(c, n):                     # left / right grid index and weight per pixel
+        if len(c) == 1:
+            z = np.zeros(n, int)
+            return z, z, np.zeros(n)
+        x = np.arange(n)
+        i = np.clip(np.searchsorted(c, x, side="right") - 1, 0, len(c) - 2)
+        return i, i + 1, (x - c[i]) / (c[i + 1] - c[i])
 
-    estimate_params=False: use the frozen BLOCK / C.
-    estimate_params=True:  estimate block and C for this image (`estimate_image_params`).
-    Returns the binary image (ink = 255).
+    y0, y1, ay = weights(cy, shape[0])
+    x0, x1, ax = weights(cx, shape[1])
+    rows = G[y0] * (1 - ay)[:, None] + G[y1] * ay[:, None]          # (h, n_cx)
+    return rows[:, x0] * (1 - ax) + rows[:, x1] * ax                 # (h, w)
+
+
+def tile_otsu(win, C, ink_frac_max=INK_FRAC_MAX):
+    """Otsu on one window -> (threshold t, valid).
+
+    Valid only if the window really holds ink on paper: Otsu class means
+    differ by >= C (not just noise) and the dark class is a minority
+    (<= ink_frac_max; shadow edges, gradients and texture split ~50/50).
+    An invalid (blank) window is all paper: its threshold is set just below
+    its darkest pixel (min - 1), so none of its pixels can be ink.
+    """
+    t, _ = otsu_threshold(win)
+    ink, paper = win[win <= t], win[win > t]
+    if (ink.size and paper.size and paper.mean() - ink.mean() >= C
+            and ink.size / win.size <= ink_frac_max):
+        return float(t), True
+    return float(win.min()) - 1, False
+
+
+def adaptive_otsu(gray, block=BLOCK, C=C, return_tiles=False):
+    """Local Otsu: ink where gray <= T, T interpolated from per-window Otsu thresholds.
+
+    Windows are block x block (reflect-padded), centred on a grid with stride
+    block // 2. A window failing the `tile_otsu` check (blank paper, shading,
+    texture) is all paper (threshold = its min - 1).
+    Returns (binary ink = 255, threshold map T), plus a dict with the tile
+    grid (centres, thresholds, valid mask) when return_tiles=True.
+    """
+    if block < 3 or block % 2 == 0:
+        raise ValueError(f"block must be odd and >= 3, got {block}")
+    r, stride = block // 2, max(1, block // 2)
+    p = np.pad(gray, r, mode="reflect")
+    cy, cx = tile_centres(gray.shape[0], stride), tile_centres(gray.shape[1], stride)
+    G = np.empty((len(cy), len(cx)))
+    valid = np.zeros(G.shape, bool)
+    for i, y in enumerate(cy):
+        for j, x in enumerate(cx):
+            G[i, j], valid[i, j] = tile_otsu(p[y:y + block, x:x + block], C)
+    T = interp_grid(G, cy, cx, gray.shape)
+    binary = np.where(gray <= T, 255, 0).astype(np.uint8)
+    if return_tiles:
+        return binary, T, {"cy": cy, "cx": cx, "thresholds": G, "valid": valid}
+    return binary, T
+
+
+def run_adaptive(img_or_path, height=HEIGHT, return_params=False):
+    """Full process: grayscale -> resize -> blur -> estimate params -> adaptive Otsu.
+
+    Block and C are always estimated for this image (`estimate_image_params`);
+    the frozen BLOCK / C / STROKE_W are only the first pass and the fallback.
+    Returns the binary image (ink = 255), or (binary, params) with
+    return_params=True. params["stroke_w"] is the stroke width in px at this
+    `height` scale (same scale as the binary), for use by later steps.
     """
     gray = prepare(img_or_path, height)
-    if estimate_params:
-        p = estimate_image_params(gray)
-        binary, _ = adaptive_mean(gray, p["block"], p["C"])
-    else:
-        binary, _ = adaptive_mean(gray)
-    return binary
+    params = estimate_image_params(gray)
+    binary, _ = adaptive_otsu(gray, params["block"], params["C"])
+    return (binary, params) if return_params else binary
 
 
 # ---- Parameter estimation ---------------------------------------------------
@@ -111,7 +182,7 @@ def estimate_noise_sigma(gray, mask, win):
 
     Same idea as the std of a hand-picked blank paper patch, done automatically.
     Use win = block, so sigma_n covers the same variation (noise + shading)
-    that the threshold sees around the local mean. None if no ink-free window.
+    that a block x block threshold window sees. None if no ink-free window.
     """
     mean = local_mean(gray, win)
     var = local_mean(gray.astype(np.int64) ** 2, win) - mean ** 2
@@ -124,14 +195,14 @@ def estimate_noise_sigma(gray, mask, win):
 def estimate_image_params(gray):
     """Per-image stroke width, noise, block and C.
 
-    A first pass with the frozen parameters gives the ink mask; from it:
-    w = median ink-run length, sigma_n = median std of ink-free windows,
-    block = odd(8 w), C = 2.5 sigma_n. Falls back to frozen values if needed.
+    A first adaptive-Otsu pass with the frozen BLOCK / C gives the ink mask;
+    from it: w = median ink-run length, sigma_n = median std of ink-free
+    windows, block = odd(8 w), C = 4 sigma_n. Falls back to frozen values.
     """
-    mask, _ = adaptive_mean(gray)
+    mask, _ = adaptive_otsu(gray)
     try:
         w = estimate_stroke_width(gray, mask=mask)
-    except ValueError:
+    except ValueError:                     # no ink in the first pass
         w = STROKE_W
     block = odd(8 * w)
     sigma_n = estimate_noise_sigma(gray, mask, block)
