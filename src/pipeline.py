@@ -8,6 +8,9 @@ Steps implemented:
        step1_params; stroke width also stored as `stroke_width` for later steps
     2. Skew correction (projection profile on step1_binary, rotate that binary,
        nearest neighbour; no re-binarization)                              -> step2_binary
+    3. Line segmentation (row projection profile + gap tolerance on step2_binary,
+       thresholds = multiples of stroke_width)                             -> step3_lines,
+       step3_info; then a per-line loop -> step3_line_crops (list of {index, box, crop})
 
 Add each new step as a `step_*` function below and call it in `run_pipeline`.
 
@@ -31,6 +34,7 @@ if str(ROOT) not in sys.path:          # allow `python src/pipeline.py` / IDE Ru
 
 from src.adaptive_thresholding import run_adaptive  # noqa: E402
 from src.skew_correction import deskew  # noqa: E402
+from src.line_segmentation import crop_line, segment_lines  # noqa: E402
 
 OUTPUTS = ROOT / "outputs"
 
@@ -51,6 +55,15 @@ def step_deskew(binary):
     return deskew(binary)
 
 
+# ---- Step 3: line segmentation --------------------------------------------------
+def step_lines(binary, stroke_width):
+    """Deskewed binary -> (lines, info); lines = [(start, end), ...] half-open rows.
+
+    Uses the step-1 stroke width (not re-estimated).
+    """
+    return segment_lines(binary, stroke_width)
+
+
 # ---- Full pipeline -----------------------------------------------------------
 def output_path(image_path, step_name):
     """outputs/Output_<image_name>_<step_name>.png"""
@@ -63,9 +76,12 @@ def run_pipeline(image_path, save=True):
 
     Returns a dict {step name: output}. With save=True each image output is
     also written to outputs/Output_<image_name>_<step name>.png
-    (non-image entries such as `step1_params`, `stroke_width`, `step2_info`
-    are not saved). `stroke_width` (px) is measured in step 1 and is valid
-    for the step-1 and step-2 binaries (rotation keeps the scale).
+    (non-image entries such as `step1_params`, `stroke_width`, `step2_info`,
+    `step3_lines`, `step3_info`, `step3_line_crops` are not saved).
+    `stroke_width` (px) is measured in step 1 and is valid for the step-1 and
+    step-2 binaries (rotation keeps the scale); pass it to every later step.
+    `step3_line_crops[k]` = {"index": k, "box": (y0, y1, x0, x1) half-open in
+    step2_binary coordinates, "crop": line image trimmed to its ink columns}.
     """
     image_path = Path("/Users/dgupta/IISc/SEM 1/DIP/Project/" + image_path)
     if not image_path.is_file():
@@ -75,6 +91,15 @@ def run_pipeline(image_path, save=True):
     results["step1_binary"], results["step1_params"] = step_threshold(image_path)
     results["stroke_width"] = results["step1_params"]["stroke_w"]
     results["step2_binary"], results["step2_info"] = step_deskew(results["step1_binary"])
+    results["step3_lines"], results["step3_info"] = step_lines(results["step2_binary"],
+                                                               results["stroke_width"])
+
+    # Per-line loop: Step 4 onwards runs here on each line crop
+    # (pass results["stroke_width"] to every step).
+    results["step3_line_crops"] = []
+    for k, (start, end) in enumerate(results["step3_lines"]):
+        crop, box = crop_line(results["step2_binary"], start, end)
+        results["step3_line_crops"].append({"index": k, "box": box, "crop": crop})
 
     if save:
         for name, img in results.items():
@@ -97,6 +122,9 @@ if __name__ == "__main__":
     info = res["step2_info"]
     print(f"Skew: theta* = {info['theta_raw']:.1f} deg, r = {info['r']:.3f}, "
           f"fallback = {info['fallback']} -> rotated by {info['theta']:.1f} deg")
+    li = res["step3_info"]
+    print(f"Lines: G_max = {li['gap_max']} px, H_min = {li['min_h']} px -> "
+          f"{len(res['step3_lines'])} lines {res['step3_lines']}")
     for name, img in res.items():
         if isinstance(img, np.ndarray):
             print("Saved", output_path(args.image, name))
