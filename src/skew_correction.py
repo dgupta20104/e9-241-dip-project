@@ -120,7 +120,7 @@ def rotate_binary(binary, theta_deg):
 def deskew(binary, r_min=R_MIN):
     """Estimate the skew on `binary` and rotate that same binary.
 
-    Returns (rotated binary, info). Does not call adaptive_mean.
+    Returns (rotated binary, info). Does not re-threshold (no adaptive_otsu call).
     """
     info = estimate_skew(binary, r_min)
     return rotate_binary(binary, info["theta"]), info

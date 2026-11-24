@@ -4,7 +4,7 @@ Each step's image result is saved directly in outputs/ as
 `Output_<image_name>_stepN_<name>.png`, one file per stage.
 
 Steps implemented:
-    1. Thresholding  (adaptive mean, block / C always estimated per image)  -> step1_binary,
+    1. Thresholding  (adaptive Otsu, block / C always estimated per image)  -> step1_binary,
        step1_params; stroke width also stored as `stroke_width` for later steps
     2. Skew correction (projection profile on step1_binary, rotate that binary,
        nearest neighbour; no re-binarization)                              -> step2_binary
@@ -41,7 +41,7 @@ OUTPUTS = ROOT / "outputs"
 
 # ---- Step 1: thresholding ----------------------------------------------------
 def step_threshold(image_path):
-    """Image path -> (binary ink = 255, params) via adaptive mean thresholding.
+    """Image path -> (binary ink = 255, params) via adaptive (local) Otsu thresholding.
 
     Block / C are always estimated for this image. params holds stroke_w,
     sigma_n, block, C; stroke_w is in px at the binary's scale.
