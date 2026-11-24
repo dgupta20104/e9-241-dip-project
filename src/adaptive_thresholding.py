@@ -4,7 +4,9 @@ A pixel is ink if  I < local_mean - C,  with the local mean taken over a
 block x block window via an integral image. No morphology.
 Spec: `Claude Chat Memory/Adaptive_Thresholding.md`.
 
-Pipeline entry point: `run_adaptive(img_or_path)` -> uint8 binary, ink = 255.
+Pipeline entry point: `run_adaptive(img_or_path, return_params=True)` ->
+(uint8 binary with ink = 255, params incl. stroke width "stroke_w").
+Parameters are always estimated per image.
 """
 
 import math
@@ -89,20 +91,19 @@ def adaptive_mean(gray, block=BLOCK, C=C):
     return np.where(gray < T, 255, 0).astype(np.uint8), T
 
 
-def run_adaptive(img_or_path, height=HEIGHT, estimate_params=False):
-    """Full process: grayscale -> resize -> blur -> adaptive mean.
+def run_adaptive(img_or_path, height=HEIGHT, return_params=False):
+    """Full process: grayscale -> resize -> blur -> estimate params -> adaptive mean.
 
-    estimate_params=False: use the frozen BLOCK / C.
-    estimate_params=True:  estimate block and C for this image (`estimate_image_params`).
-    Returns the binary image (ink = 255).
+    Block and C are always estimated for this image (`estimate_image_params`);
+    the frozen BLOCK / C / STROKE_W are only the first pass and the fallback.
+    Returns the binary image (ink = 255), or (binary, params) with
+    return_params=True. params["stroke_w"] is the stroke width in px at this
+    `height` scale (same scale as the binary), for use by later steps.
     """
     gray = prepare(img_or_path, height)
-    if estimate_params:
-        p = estimate_image_params(gray)
-        binary, _ = adaptive_mean(gray, p["block"], p["C"])
-    else:
-        binary, _ = adaptive_mean(gray)
-    return binary
+    params = estimate_image_params(gray)
+    binary, _ = adaptive_mean(gray, params["block"], params["C"])
+    return (binary, params) if return_params else binary
 
 
 # ---- Parameter estimation ---------------------------------------------------
@@ -131,7 +132,7 @@ def estimate_image_params(gray):
     mask, _ = adaptive_mean(gray)
     try:
         w = estimate_stroke_width(gray, mask=mask)
-    except ValueError:
+    except ValueError:                     # no ink in the first pass
         w = STROKE_W
     block = odd(8 * w)
     sigma_n = estimate_noise_sigma(gray, mask, block)
