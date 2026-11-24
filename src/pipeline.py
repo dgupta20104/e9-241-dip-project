@@ -1,7 +1,9 @@
 """End-to-end pipeline: image path -> output of every step implemented so far.
 
-Each step's image result is saved directly in outputs/ as
-`Output_<image_name>_stepN_<name>.png`, one file per stage.
+Only the output of the latest step is saved, directly in outputs/ as
+`Output_<image_name>_<name>.png` (currently `..._step3_line_boxes.png`:
+the deskewed binary with the step-3 line boxes drawn). Intermediate
+results are returned in the dict but not written to disk.
 
 Steps implemented:
     1. Thresholding  (adaptive Otsu, block / C always estimated per image)  -> step1_binary,
@@ -10,7 +12,8 @@ Steps implemented:
        nearest neighbour; no re-binarization)                              -> step2_binary
     3. Line segmentation (row projection profile + gap tolerance on step2_binary,
        thresholds = multiples of stroke_width)                             -> step3_lines,
-       step3_info; then a per-line loop -> step3_line_crops (list of {index, box, crop})
+       step3_info; then a per-line loop -> step3_line_crops (list of {index, box, crop});
+       step3_line_boxes = boxes drawn on step2_binary (the saved image)
 
 Add each new step as a `step_*` function below and call it in `run_pipeline`.
 
@@ -26,7 +29,6 @@ import sys
 from pathlib import Path
 
 import cv2
-import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:          # allow `python src/pipeline.py` / IDE Run button
@@ -64,7 +66,25 @@ def step_lines(binary, stroke_width):
     return segment_lines(binary, stroke_width)
 
 
+# ---- Visualisation of the final output -----------------------------------------
+def draw_line_boxes(binary, line_crops):
+    """Binary (ink = 255) -> BGR image with each line's box and index drawn.
+
+    Boxes are the half-open (y0, y1, x0, x1) from `step3_line_crops`.
+    """
+    vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    for item in line_crops:
+        y0, y1, x0, x1 = item["box"]
+        cv2.rectangle(vis, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 255), 2)
+        cv2.putText(vis, str(item["index"]), (x0 + 4, y0 + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    return vis
+
+
 # ---- Full pipeline -----------------------------------------------------------
+SAVED_OUTPUT = "step3_line_boxes"      # the only image written to outputs/
+
+
 def output_path(image_path, step_name):
     """outputs/Output_<image_name>_<step_name>.png"""
     OUTPUTS.mkdir(parents=True, exist_ok=True)
@@ -74,10 +94,10 @@ def output_path(image_path, step_name):
 def run_pipeline(image_path, save=True):
     """Run all implemented steps on one image.
 
-    Returns a dict {step name: output}. With save=True each image output is
-    also written to outputs/Output_<image_name>_<step name>.png
-    (non-image entries such as `step1_params`, `stroke_width`, `step2_info`,
-    `step3_lines`, `step3_info`, `step3_line_crops` are not saved).
+    Returns a dict {step name: output}. With save=True only
+    results[SAVED_OUTPUT] (the latest step's output) is written to
+    outputs/Output_<image_name>_<SAVED_OUTPUT>.png; intermediate results
+    stay in the dict only.
     `stroke_width` (px) is measured in step 1 and is valid for the step-1 and
     step-2 binaries (rotation keeps the scale); pass it to every later step.
     `step3_line_crops[k]` = {"index": k, "box": (y0, y1, x0, x1) half-open in
@@ -101,10 +121,11 @@ def run_pipeline(image_path, save=True):
         crop, box = crop_line(results["step2_binary"], start, end)
         results["step3_line_crops"].append({"index": k, "box": box, "crop": crop})
 
+    results["step3_line_boxes"] = draw_line_boxes(results["step2_binary"],
+                                                  results["step3_line_crops"])
+
     if save:
-        for name, img in results.items():
-            if isinstance(img, np.ndarray):
-                cv2.imwrite(str(output_path(image_path, name)), img)
+        cv2.imwrite(str(output_path(image_path, SAVED_OUTPUT)), results[SAVED_OUTPUT])
     return results
 
 
@@ -125,6 +146,4 @@ if __name__ == "__main__":
     li = res["step3_info"]
     print(f"Lines: G_max = {li['gap_max']} px, H_min = {li['min_h']} px -> "
           f"{len(res['step3_lines'])} lines {res['step3_lines']}")
-    for name, img in res.items():
-        if isinstance(img, np.ndarray):
-            print("Saved", output_path(args.image, name))
+    print("Saved", output_path(args.image, SAVED_OUTPUT))
