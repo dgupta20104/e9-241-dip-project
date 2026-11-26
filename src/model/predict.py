@@ -1,6 +1,6 @@
 """Use the trained model: line crops / images -> LaTeX strings.
 
-Made to be called from the pipeline later (not hooked into src/pipeline.py yet):
+Used by src/pipeline.py (Step 4: one call per line crop), or directly:
 
     from src.model.predict import load_model, predict_crops
     model, vocab = load_model()                       # once, loads outputs/model/best.pt

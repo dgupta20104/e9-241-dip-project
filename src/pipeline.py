@@ -1,9 +1,10 @@
-"""End-to-end pipeline: image path -> output of every step implemented so far.
+r"""End-to-end pipeline: image path -> LaTeX for the whole image.
 
-Only the output of the latest step is saved, in outputs/pipeline/ as
-`Output_<image_name>_<name>.png` (currently `..._step3_line_boxes.png`:
-the deskewed binary with the step-3 line boxes drawn). Intermediate
-results are returned in the dict but not written to disk.
+Two files are saved in outputs/pipeline/ per image:
+    Output_<image_name>.tex                    the LaTeX of all lines (final output)
+    Output_<image_name>_step3_line_boxes.png   deskewed binary with the line boxes,
+                                               numbered like the lines in the .tex
+Other intermediate results are returned in the dict but not written to disk.
 
 Steps implemented:
     1. Thresholding  (adaptive Otsu, block / C always estimated per image)  -> step1_binary,
@@ -13,7 +14,10 @@ Steps implemented:
     3. Line segmentation (row projection profile + gap tolerance on step2_binary,
        thresholds = multiples of stroke_width)                             -> step3_lines,
        step3_info; then a per-line loop -> step3_line_crops (list of {index, box, crop});
-       step3_line_boxes = boxes drawn on step2_binary (the saved image)
+       step3_line_boxes = boxes drawn on step2_binary
+    4. Prediction (trained model, outputs/model/best.pt) on every line crop, inside the
+       per-line loop -> step3_line_crops[k]["latex"], step4_line_latex (list, top->bottom);
+       lines joined with the LaTeX new-line `\\` inside \begin{gathered} -> step4_latex
 
 Add each new step as a `step_*` function below and call it in `run_pipeline`.
 
@@ -37,6 +41,7 @@ if str(ROOT) not in sys.path:          # allow `python src/pipeline.py` / IDE Ru
 from src.adaptive_thresholding import run_adaptive  # noqa: E402
 from src.skew_correction import deskew  # noqa: E402
 from src.line_segmentation import crop_line, segment_lines  # noqa: E402
+from src.model.predict import DEFAULT_WEIGHTS, load_model, predict_crops  # noqa: E402
 
 OUTPUTS = ROOT / "outputs" / "pipeline"
 
@@ -66,7 +71,41 @@ def step_lines(binary, stroke_width):
     return segment_lines(binary, stroke_width)
 
 
-# ---- Visualisation of the final output -----------------------------------------
+# ---- Step 4: prediction with the trained model ---------------------------------
+_MODEL_CACHE = {}      # weights path -> (model, vocab), so the model is loaded only once
+
+
+def get_model(weights=DEFAULT_WEIGHTS):
+    """Load the trained model and its vocabulary the first time, then reuse them."""
+    key = str(weights)
+    if key not in _MODEL_CACHE:
+        _MODEL_CACHE[key] = load_model(weights)
+    return _MODEL_CACHE[key]
+
+
+def step_predict(crop, model, vocab):
+    """One line crop (binary, white ink 255 on black) -> LaTeX string for that line."""
+    # predict_crops works on a list of images; we give it a list with just this crop.
+    # ink_white=True because our crops have white ink on a black background.
+    return predict_crops(model, vocab, [crop], ink_white=True)[0]
+
+
+def combine_lines(line_latex):
+    r"""List of per-line LaTeX strings (top -> bottom) -> one LaTeX block.
+
+    Lines are separated by the LaTeX new-line token `\\`. They are wrapped in
+    \begin{gathered} ... \end{gathered}, because `\\` alone does not break a
+    line in math mode; inside `gathered` each line shows up as its own centred
+    line (paste the block between $$ ... $$, needs the amsmath package).
+    No lines -> empty string.
+    """
+    if not line_latex:
+        return ""
+    body = " \\\\\n".join(line_latex)          # " \\" + newline between lines, none after the last
+    return "\\begin{gathered}\n" + body + "\n\\end{gathered}\n"
+
+
+# ---- Visualisation of the line boxes -------------------------------------------
 def draw_line_boxes(binary, line_crops):
     """Binary (ink = 255) -> BGR image with each line's box and index drawn.
 
@@ -82,7 +121,7 @@ def draw_line_boxes(binary, line_crops):
 
 
 # ---- Full pipeline -----------------------------------------------------------
-SAVED_OUTPUT = "step3_line_boxes"      # the only image written to outputs/pipeline/
+SAVED_IMAGE = "step3_line_boxes"       # image written next to the .tex file
 
 
 def output_path(image_path, step_name):
@@ -91,17 +130,25 @@ def output_path(image_path, step_name):
     return OUTPUTS / f"Output_{Path(image_path).stem}_{step_name}.png"
 
 
-def run_pipeline(image_path, save=True):
+def latex_path(image_path):
+    """outputs/pipeline/Output_<image_name>.tex"""
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    return OUTPUTS / f"Output_{Path(image_path).stem}.tex"
+
+
+def run_pipeline(image_path, save=True, weights=DEFAULT_WEIGHTS):
     """Run all implemented steps on one image.
 
-    Returns a dict {step name: output}. With save=True only
-    results[SAVED_OUTPUT] (the latest step's output) is written to
-    outputs/pipeline/Output_<image_name>_<SAVED_OUTPUT>.png; intermediate results
-    stay in the dict only.
+    Returns a dict {step name: output}. With save=True the final LaTeX
+    (results["step4_latex"]) is written to outputs/pipeline/Output_<image_name>.tex
+    and the line-box image to outputs/pipeline/Output_<image_name>_step3_line_boxes.png;
+    other intermediate results stay in the dict only.
     `stroke_width` (px) is measured in step 1 and is valid for the step-1 and
     step-2 binaries (rotation keeps the scale); pass it to every later step.
     `step3_line_crops[k]` = {"index": k, "box": (y0, y1, x0, x1) half-open in
-    step2_binary coordinates, "crop": line image trimmed to its ink columns}.
+    step2_binary coordinates, "crop": line image trimmed to its ink columns,
+    "latex": the model's LaTeX for that line}.
+    `weights`: model checkpoint used in step 4 (loaded once, then reused).
     """
     image_path = Path("/Users/dgupta/IISc/SEM 1/DIP/Project/" + image_path)
     if not image_path.is_file():
@@ -114,18 +161,29 @@ def run_pipeline(image_path, save=True):
     results["step3_lines"], results["step3_info"] = step_lines(results["step2_binary"],
                                                                results["stroke_width"])
 
+    # Step 4 needs the trained model; load it once (reused on later calls).
+    model, vocab = get_model(weights)
+
     # Per-line loop: Step 4 onwards runs here on each line crop
-    # (pass results["stroke_width"] to every step).
+    # (pass results["stroke_width"] to every step that needs it).
     results["step3_line_crops"] = []
+    results["step4_line_latex"] = []
     for k, (start, end) in enumerate(results["step3_lines"]):
         crop, box = crop_line(results["step2_binary"], start, end)
-        results["step3_line_crops"].append({"index": k, "box": box, "crop": crop})
+        latex = step_predict(crop, model, vocab)            # Step 4: this line -> LaTeX
+        results["step3_line_crops"].append({"index": k, "box": box, "crop": crop,
+                                            "latex": latex})
+        results["step4_line_latex"].append(latex)
+
+    # All lines, top to bottom, joined with the LaTeX new-line `\\` into one block.
+    results["step4_latex"] = combine_lines(results["step4_line_latex"])
 
     results["step3_line_boxes"] = draw_line_boxes(results["step2_binary"],
                                                   results["step3_line_crops"])
 
     if save:
-        cv2.imwrite(str(output_path(image_path, SAVED_OUTPUT)), results[SAVED_OUTPUT])
+        latex_path(image_path).write_text(results["step4_latex"], encoding="utf-8")
+        cv2.imwrite(str(output_path(image_path, SAVED_IMAGE)), results[SAVED_IMAGE])
     return results
 
 
@@ -146,4 +204,8 @@ if __name__ == "__main__":
     li = res["step3_info"]
     print(f"Lines: G_max = {li['gap_max']} px, H_min = {li['min_h']} px -> "
           f"{len(res['step3_lines'])} lines {res['step3_lines']}")
-    print("Saved", output_path(args.image, SAVED_OUTPUT))
+    for k, latex in enumerate(res["step4_line_latex"]):
+        print(f"  line {k}: {latex}")
+    print("LaTeX:\n" + res["step4_latex"])
+    print("Saved", latex_path(args.image))
+    print("Saved", output_path(args.image, SAVED_IMAGE))
