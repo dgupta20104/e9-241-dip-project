@@ -329,7 +329,7 @@ def fmt(m):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Train the CNN + BiLSTM + attention model.")
     ap.add_argument("--epochs", type=int, default=100, help="maximum number of epochs")
-    ap.add_argument("--batch", type=int, default=64, help="images per training step")
+    ap.add_argument("--batch", type=int, default=32, help="images per training step")
     ap.add_argument("--eval-batch", type=int, default=32, help="images per step when decoding")
     ap.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
     ap.add_argument("--patience", type=int, default=10,

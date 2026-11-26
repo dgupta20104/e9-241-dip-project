@@ -4,9 +4,9 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Data and outputs (large files)
-data/raw/*
-data/processed/*
-outputs/*
+data/*
+data.zip
+outputs/photos/*
 !**/.gitkeep
 
 # OS
