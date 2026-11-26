@@ -342,9 +342,9 @@ def parse_args(argv=None):
     ap.add_argument("--device", default=None, help="force cuda / mps / cpu")
     ap.add_argument("--limit", type=int, default=None,
                     help="use only the first N images of each split (quick test)")
-    ap.add_argument("--train-eval-size", type=int, default=300,
+    ap.add_argument("--train-eval-size", type=int, default=1000,
                     help="train images (fixed random subset) decoded every epoch for train metrics")
-    ap.add_argument("--valid-eval-size", type=int, default=100,
+    ap.add_argument("--valid-eval-size", type=int, default=300,
                     help="valid images (fixed random subset) decoded every epoch; 0 = all")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=str(OUT), help="folder for weights, history and plots")

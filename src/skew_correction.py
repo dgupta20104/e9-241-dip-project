@@ -19,7 +19,7 @@ import numpy as np
 COARSE_STEP = 1.0    # deg, coarse search over [-90, 90)
 FINE_STEP = 0.1      # deg, fine search ...
 FINE_RANGE = 1.0     # ... within +-FINE_RANGE of the coarse best
-R_MIN = 2.8          # weak-peak threshold on r = S(theta*) / median S (chosen by eye, notebook 03)
+R_MIN = 2       # weak-peak threshold on r = S(theta*) / median S (chosen by eye, notebook 03)
 
 
 # ---- Angle estimation -------------------------------------------------------------
