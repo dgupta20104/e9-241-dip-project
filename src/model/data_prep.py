@@ -37,10 +37,10 @@ Rendering:
       pixel-level ground-truth binary for Step 1.
 
 Usage (from the project root):
-    python -m src.data_prep                       # all splits
-    python -m src.data_prep --splits valid --limit 20
+    python -m src.model.data_prep                       # all splits
+    python -m src.model.data_prep --splits valid --limit 20
 
-    from src.data_prep import load_split, parse_inkml, render_expression
+    from src.model.data_prep import load_split, parse_inkml, render_expression
     records = load_split("valid")
 """
 
@@ -55,7 +55,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]            # project root (src/model/data_prep.py -> ../..)
 DATASET = ROOT / "data" / "raw" / "Crohome Dataset"   # split lists live here
 OUT = ROOT / "data" / "processed" / "crohme"
 SPLITS = ("train", "valid", "test")

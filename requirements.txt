@@ -1,4 +1,6 @@
 # Project dependencies (install with: pip install -r requirements.txt)
-numpy
-opencv-python
-matplotlib
+# Python 3.11 (conda env dip_project)
+numpy==2.4.6
+opencv-python==5.1.0.95
+matplotlib==3.11.2
+torch==2.14.1          # src/model/ only
