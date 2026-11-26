@@ -1,6 +1,6 @@
 """End-to-end pipeline: image path -> output of every step implemented so far.
 
-Only the output of the latest step is saved, directly in outputs/ as
+Only the output of the latest step is saved, in outputs/pipeline/ as
 `Output_<image_name>_<name>.png` (currently `..._step3_line_boxes.png`:
 the deskewed binary with the step-3 line boxes drawn). Intermediate
 results are returned in the dict but not written to disk.
@@ -19,10 +19,10 @@ Add each new step as a `step_*` function below and call it in `run_pipeline`.
 
 Usage:
     from src.pipeline import run_pipeline
-    results = run_pipeline("data/raw/photos/xyz.jpg")
+    results = run_pipeline("data/photos/xyz.jpg")
 
     # or from the project root:
-    python -m src.pipeline data/raw/photos/xyz.jpg
+    python -m src.pipeline data/photos/xyz.jpg
 """
 
 import sys
@@ -38,7 +38,7 @@ from src.adaptive_thresholding import run_adaptive  # noqa: E402
 from src.skew_correction import deskew  # noqa: E402
 from src.line_segmentation import crop_line, segment_lines  # noqa: E402
 
-OUTPUTS = ROOT / "outputs"
+OUTPUTS = ROOT / "outputs" / "pipeline"
 
 
 # ---- Step 1: thresholding ----------------------------------------------------
@@ -82,11 +82,11 @@ def draw_line_boxes(binary, line_crops):
 
 
 # ---- Full pipeline -----------------------------------------------------------
-SAVED_OUTPUT = "step3_line_boxes"      # the only image written to outputs/
+SAVED_OUTPUT = "step3_line_boxes"      # the only image written to outputs/pipeline/
 
 
 def output_path(image_path, step_name):
-    """outputs/Output_<image_name>_<step_name>.png"""
+    """outputs/pipeline/Output_<image_name>_<step_name>.png"""
     OUTPUTS.mkdir(parents=True, exist_ok=True)
     return OUTPUTS / f"Output_{Path(image_path).stem}_{step_name}.png"
 
@@ -96,7 +96,7 @@ def run_pipeline(image_path, save=True):
 
     Returns a dict {step name: output}. With save=True only
     results[SAVED_OUTPUT] (the latest step's output) is written to
-    outputs/Output_<image_name>_<SAVED_OUTPUT>.png; intermediate results
+    outputs/pipeline/Output_<image_name>_<SAVED_OUTPUT>.png; intermediate results
     stay in the dict only.
     `stroke_width` (px) is measured in step 1 and is valid for the step-1 and
     step-2 binaries (rotation keeps the scale); pass it to every later step.
