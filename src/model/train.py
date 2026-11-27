@@ -36,7 +36,6 @@ Written to outputs/model/ once, at the end of training:
     test_predictions.tsv    image, truth, prediction, edit distance (test, best checkpoint)
 
 Against overfitting (tuning guide in CNN_BiLSTM_Attention_Model.md):
-    model.py           halved CNN channels 16-32-64-128 (the spec has 32-64-128-256)
     --enc-dropout p    dropout in the encoder (row-BiLSTM output and final grid G)
     --dropout p        dropout in the decoder (before the output layer)
     augmentation       stroke width, slant, stretch, rotation, elastic warp, blur, specks

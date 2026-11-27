@@ -3,15 +3,12 @@
 Design: Claude Chat Memory/CNN_BiLSTM_Attention_Model.md
 
     line image (1 x 64 x W)
-      -> CNN                       -> 128 x 8 x W/8    (a grid of feature vectors)
+      -> CNN                       -> 256 x 8 x W/8    (a grid of feature vectors)
       -> row BiLSTM (along W')     -> 256 x 8 x W/8    (each vector now knows its left/right)
       -> column BiLSTM (along H')  -> 256 x 8 x W/8    (... and what is above/below) = G
       -> 2-D attention + LSTM decoder, one token per step until <end>
 
-CNN channels: 16 -> 32 -> 64 -> 128. That is half of the spec's
-32 -> 64 -> 128 -> 256, because the first full training run overfitted (tuning
-guide: "overfitting -> halve channels"). Checkpoints trained with the spec's
-channels no longer fit this model.
+CNN channels: 32 -> 64 -> 128 -> 256, as in the spec (CNN_CHANNELS).
 
 Dropout (randomly zeroes values during training only; off in model.eval()):
     enc_dropout: in the encoder, on the row-BiLSTM output and on the final grid G
@@ -157,11 +154,11 @@ def conv_bn_relu(c_in, c_out):
     )
 
 
-CNN_CHANNELS = (16, 32, 64, 128)   # blocks 1-4 (half of the spec's 32, 64, 128, 256)
+CNN_CHANNELS = (32, 64, 128, 256)   # channels of blocks 1-4 (as in the spec)
 
 
 class CNN(nn.Module):
-    """(B, 1, 64, W) -> (B, 128, 8, W/8). Channels double while the size halves.
+    """(B, 1, 64, W) -> (B, 256, 8, W/8). Channels double while the size halves.
 
     Receptive field: one output vector "sees" a 62 x 62 px patch of the input,
     about one symbol plus its neighbours.
