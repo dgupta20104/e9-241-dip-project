@@ -31,11 +31,18 @@ Written to outputs/model/ once, at the end of training:
     history.csv             one row per epoch: epoch, lr, train_loss, valid_loss,
                             train_* and valid_* (exprate, le1, le2, cer, token_acc), seconds
     accuracy_vs_epoch.png   train vs valid: loss | ExpRate | token accuracy
-    test_results.json       train-subset, full valid and test numbers of the best checkpoint
+    test_results.json       model config (channels, dropouts) + train-subset, full valid
+                            and test numbers of the best checkpoint
     test_predictions.tsv    image, truth, prediction, edit distance (test, best checkpoint)
+
+Against overfitting (tuning guide in CNN_BiLSTM_Attention_Model.md):
+    --enc-dropout p    dropout in the encoder (row-BiLSTM output and final grid G)
+    --dropout p        dropout in the decoder (before the output layer)
+    augmentation       stroke width, slant, stretch, rotation, elastic warp, blur, specks
 
 Usage (from the project root):
     python -m src.model.train                                  # full training
+    python -m src.model.train --enc-dropout 0.5 --dropout 0.5  # with both dropouts
     python -m src.model.train --limit 64 --epochs 2 --batch 8 --train-eval-size 32  # quick test
 """
 
@@ -63,8 +70,8 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")                  # draw plots into files, no window needed
 import matplotlib.pyplot as plt  # noqa: E402
 
-from src.model.model import (Im2LatexModel, count_parameters, crop_to_ink,  # noqa: E402
-                             get_device, pad_images, prepare_image)
+from src.model.model import (CNN_CHANNELS, Im2LatexModel, count_parameters,  # noqa: E402
+                             crop_to_ink, get_device, pad_images, prepare_image)
 from src.model.vocab import DATA, PAD, VOCAB_PATH, Vocab, read_truth_tsv, tokenize  # noqa: E402
 
 OUT = ROOT / "outputs" / "model"
@@ -75,24 +82,67 @@ MAX_LEN = 150          # longest label the decoder has to write (train max is 12
 # Every epoch each training image gets a NEW random variation, so the model sees
 # many slightly different versions and learns the symbols, not the exact pixels.
 # Nothing is saved to disk.
+# Sizes below are in render pixels: a typical CROHME symbol is ~48 px high,
+# strokes are 2-4 px wide (src/model/data_prep.py).
+def shear(mask, k):
+    """Slant the writing: every row moves sideways by k * (its row number).
+
+    |k| = 0.3 is a lean of about 17 degrees. The canvas grows so no ink is cut off.
+    """
+    h, w = mask.shape
+    shift = max(0.0, -k * (h - 1))              # when rows move left, push all back right
+    new_w = w + int(np.ceil(abs(k) * (h - 1))) + 1
+    M = np.float32([[1, k, shift], [0, 1, 0]])  # x' = x + k*y + shift, y' = y
+    return cv2.warpAffine(mask, M, (new_w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+
+
+def elastic_warp(mask, step=32, amount=4.0):
+    """Bend the strokes a little, as if another hand wrote the same thing.
+
+    A coarse grid (one point every `step` px) gets random shifts of up to
+    `amount` px; smooth (cubic) interpolation spreads them to every pixel, so
+    the strokes wobble gently but stay connected.
+    """
+    pad = int(np.ceil(amount)) + 1              # room so no ink is pushed off the edge
+    mask = cv2.copyMakeBorder(mask, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+    h, w = mask.shape
+    gh, gw = h // step + 2, w // step + 2       # size of the coarse grid
+    # torch random numbers, not numpy's (see augment_tensor)
+    shifts = (torch.rand(2, gh, gw) * 2 - 1).numpy() * amount
+    dx = cv2.resize(shifts[0], (w, h), interpolation=cv2.INTER_CUBIC)
+    dy = cv2.resize(shifts[1], (w, h), interpolation=cv2.INTER_CUBIC)
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    # output pixel (x, y) takes the input pixel at (x + dx, y + dy)
+    return cv2.remap(mask, xs + dx, ys + dy, cv2.INTER_LINEAR, borderValue=0)
+
+
 def augment_mask(mask):
     """Random shape changes on the cropped binary mask (ink = 255), before resizing."""
-    # 1) stroke width: thicker (dilate) or thinner (erode) pen
+    # 1) stroke width: thicker (dilate) or thinner (erode) pen. Thicker is more
+    #    common, because photo crops from the pipeline have thicker strokes than
+    #    the renders.
     r = random.random()
-    if r < 0.3:
-        mask = cv2.dilate(mask, np.ones((3, 3), np.uint8))
-    elif r < 0.5:
-        thinner = cv2.erode(mask, np.ones((2, 2), np.uint8))
-        if thinner.any():                       # don't erase thin strokes completely
+    if r < 0.4:
+        k = random.choice([2, 3, 4])            # strokes get 1 to 3 px wider
+        mask = cv2.dilate(mask, np.ones((k, k), np.uint8))
+    elif r < 0.6:
+        k = random.choice([2, 3])               # strokes get 1 to 2 px thinner
+        thinner = cv2.erode(mask, np.ones((k, k), np.uint8))
+        # only keep it if most of the ink survives (thin strokes could vanish)
+        if (thinner > 127).sum() >= 0.4 * (mask > 127).sum():
             mask = thinner
 
-    # 2) slight sideways stretch / squeeze (handwriting width varies)
+    # 2) slant: writing leaning left or right, up to about 17 degrees
+    if random.random() < 0.5:
+        mask = shear(mask, random.uniform(-0.3, 0.3))
+
+    # 3) sideways stretch / squeeze (handwriting width varies)
     if random.random() < 0.5:
         h, w = mask.shape
-        new_w = max(1, int(round(w * random.uniform(0.85, 1.15))))
+        new_w = max(1, int(round(w * random.uniform(0.8, 1.2))))
         mask = cv2.resize(mask, (new_w, h), interpolation=cv2.INTER_NEAREST)
 
-    # 3) small rotation, -3 to +3 degrees (Step 2 never levels a line perfectly)
+    # 4) small rotation, -3 to +3 degrees (Step 2 never levels a line perfectly)
     if random.random() < 0.5:
         h, w = mask.shape
         angle = random.uniform(-3.0, 3.0)
@@ -104,16 +154,20 @@ def augment_mask(mask):
         M[1, 2] += new_h / 2 - h / 2
         mask = cv2.warpAffine(mask, M, (new_w, new_h), flags=cv2.INTER_NEAREST, borderValue=0)
 
+    # 5) elastic warp: strokes bend a little (shifts of up to 4 px, ~8 % of a symbol)
+    if random.random() < 0.5:
+        mask = elastic_warp(mask)
+
     return crop_to_ink(mask)                    # the changes may move the ink box
 
 
 def augment_tensor(x):
     """Random blur / specks on the final (1, 64, W) input (values 0..1)."""
-    # 4) blur: softer stroke edges
+    # 6) blur: softer stroke edges
     if random.random() < 0.3:
         img = cv2.GaussianBlur(x[0].numpy(), (3, 3), random.uniform(0.5, 1.0))
         x = torch.from_numpy(img).unsqueeze(0)
-    # 5) noise: a few random pixels flipped, like leftover specks after thresholding.
+    # 7) noise: a few random pixels flipped, like leftover specks after thresholding.
     #    (torch's random numbers, not numpy's: each image-loading worker gets its
     #    own torch seed, numpy would give every worker the same "random" specks)
     if random.random() < 0.3:
@@ -338,6 +392,8 @@ def parse_args(argv=None):
                     help="divide the learning rate by 10 after this many epochs without progress")
     ap.add_argument("--coverage", action="store_true", help="use attention coverage")
     ap.add_argument("--dropout", type=float, default=0.0, help="dropout before the output layer")
+    ap.add_argument("--enc-dropout", type=float, default=0.0,
+                    help="dropout in the encoder: after the row BiLSTM and on the final grid G")
     ap.add_argument("--workers", type=int, default=2, help="processes that load images")
     ap.add_argument("--device", default=None, help="force cuda / mps / cpu")
     ap.add_argument("--limit", type=int, default=None,
@@ -402,8 +458,12 @@ def main(argv=None):
     test_loader = DataLoader(test_set, batch_size=args.eval_batch, shuffle=False, **loader_kw)
 
     # 3) Model, optimizer, learning-rate schedule
-    model = Im2LatexModel(len(vocab), use_coverage=args.coverage, dropout=args.dropout).to(device)
-    print(f"Model: {count_parameters(model) / 1e6:.2f} M parameters")
+    model = Im2LatexModel(len(vocab), use_coverage=args.coverage, dropout=args.dropout,
+                          enc_dropout=args.enc_dropout).to(device)
+    print(f"Model: {count_parameters(model) / 1e6:.2f} M parameters | "
+          f"CNN channels {'-'.join(map(str, CNN_CHANNELS))} | coverage {args.coverage}")
+    print(f"Dropout: encoder {args.enc_dropout} (row BiLSTM output + G) | "
+          f"decoder {args.dropout} (before the output layer)")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     # Divide the learning rate by 10 when the valid CER stops going down.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -477,8 +537,8 @@ def main(argv=None):
     save_history(history, out / "history.csv")
     plot_history(history, out / "accuracy_vs_epoch.png", best_epoch)
     with open(out / "test_results.json", "w") as fh:
-        json.dump({"best_epoch": best_epoch, "train_subset": train_m, "valid": valid_m,
-                   "test": test_m}, fh, indent=2)
+        json.dump({"best_epoch": best_epoch, "model_config": model.config,
+                   "train_subset": train_m, "valid": valid_m, "test": test_m}, fh, indent=2)
     with open(out / "test_predictions.tsv", "w", encoding="utf-8") as fh:
         fh.write("image\ttruth\tprediction\tedit_distance\n")
         for image, truth, pred, dist in test_rows:
