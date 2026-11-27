@@ -3,10 +3,20 @@
 Design: Claude Chat Memory/CNN_BiLSTM_Attention_Model.md
 
     line image (1 x 64 x W)
-      -> CNN                       -> 256 x 8 x W/8    (a grid of feature vectors)
+      -> CNN                       -> 128 x 8 x W/8    (a grid of feature vectors)
       -> row BiLSTM (along W')     -> 256 x 8 x W/8    (each vector now knows its left/right)
       -> column BiLSTM (along H')  -> 256 x 8 x W/8    (... and what is above/below) = G
       -> 2-D attention + LSTM decoder, one token per step until <end>
+
+CNN channels: 16 -> 32 -> 64 -> 128. That is half of the spec's
+32 -> 64 -> 128 -> 256, because the first full training run overfitted (tuning
+guide: "overfitting -> halve channels"). Checkpoints trained with the spec's
+channels no longer fit this model.
+
+Dropout (randomly zeroes values during training only; off in model.eval()):
+    enc_dropout: in the encoder, on the row-BiLSTM output and on the final grid G
+                 (none inside the CNN - BatchNorm already regularises there)
+    dropout    : in the decoder, just before the output layer W_o
 
 This file also holds the input preparation (`prepare_image`) that training
 AND prediction both use, so the model always sees images made the same way:
@@ -147,8 +157,11 @@ def conv_bn_relu(c_in, c_out):
     )
 
 
+CNN_CHANNELS = (16, 32, 64, 128)   # blocks 1-4 (half of the spec's 32, 64, 128, 256)
+
+
 class CNN(nn.Module):
-    """(B, 1, 64, W) -> (B, 256, 8, W/8). Channels double while the size halves.
+    """(B, 1, 64, W) -> (B, 128, 8, W/8). Channels double while the size halves.
 
     Receptive field: one output vector "sees" a 62 x 62 px patch of the input,
     about one symbol plus its neighbours.
@@ -156,13 +169,15 @@ class CNN(nn.Module):
 
     def __init__(self):
         super().__init__()
+        c1, c2, c3, c4 = CNN_CHANNELS
         self.layers = nn.Sequential(
-            conv_bn_relu(1, 32), nn.MaxPool2d(2),        # block 1 -> 32 x 32 x W/2
-            conv_bn_relu(32, 64), nn.MaxPool2d(2),       # block 2 -> 64 x 16 x W/4
-            conv_bn_relu(64, 128), conv_bn_relu(128, 128),
-            nn.MaxPool2d(2),                             # block 3 -> 128 x 8 x W/8
-            conv_bn_relu(128, 256), conv_bn_relu(256, 256),   # block 4 -> 256 x 8 x W/8
+            conv_bn_relu(1, c1), nn.MaxPool2d(2),        # block 1 -> c1 x 32 x W/2
+            conv_bn_relu(c1, c2), nn.MaxPool2d(2),       # block 2 -> c2 x 16 x W/4
+            conv_bn_relu(c2, c3), conv_bn_relu(c3, c3),
+            nn.MaxPool2d(2),                             # block 3 -> c3 x 8 x W/8
+            conv_bn_relu(c3, c4), conv_bn_relu(c4, c4),  # block 4 -> c4 x 8 x W/8
         )
+        self.out_channels = c4                           # values per grid vector
 
     def forward(self, x):
         return self.layers(x)
@@ -176,14 +191,21 @@ class Encoder(nn.Module):
     vector learns what is to its left and right. Column BiLSTM: every grid
     column is then read top->bottom and bottom->top, so each vector also
     learns what is above and below it (needed for fractions, powers, ...).
+
+    Dropout (training only) is applied twice: on the row-BiLSTM output (what
+    the column BiLSTM reads) and on the final grid G (what the attention and
+    the decoder's start state read). Not inside the CNN.
     """
 
-    def __init__(self, hidden=128):
+    def __init__(self, hidden=128, dropout=0.0):
         super().__init__()
         self.cnn = CNN()
         # bidirectional=True -> output = forward half + backward half = 2 * hidden = 256
-        self.row_lstm = nn.LSTM(256, hidden, batch_first=True, bidirectional=True)
+        self.row_lstm = nn.LSTM(self.cnn.out_channels, hidden, batch_first=True,
+                                bidirectional=True)
         self.col_lstm = nn.LSTM(2 * hidden, hidden, batch_first=True, bidirectional=True)
+        # nn.Dropout only acts in model.train(); in model.eval() it passes values unchanged.
+        self.drop = nn.Dropout(dropout)                  # 0 = off
         self.out_dim = 2 * hidden
 
     def forward(self, images, widths):
@@ -206,6 +228,7 @@ class Encoder(nn.Module):
                                       enforce_sorted=False)
         out, _ = self.row_lstm(packed)
         x, _ = pad_packed_sequence(out, batch_first=True, total_length=Wp)  # (B*H', W', 2d)
+        x = self.drop(x)                                         # encoder dropout (a)
 
         # --- column BiLSTM: every column is one sequence of H' vectors
         x = x.reshape(B, Hp, Wp, -1).permute(0, 2, 1, 3)         # (B, W', H', 2d)
@@ -215,6 +238,7 @@ class Encoder(nn.Module):
         # --- back to one list of N = H' * W' vectors per image (row by row)
         G = x.reshape(B, Wp, Hp, -1).permute(0, 2, 1, 3)         # (B, H', W', 2d)
         G = G.reshape(B, Hp * Wp, -1)                            # (B, N, 2d)
+        G = self.drop(G)            # encoder dropout (b): attention and s_0 both see this G
 
         # mask[b, n] = True if position n of image b lies inside the real image
         col_ok = torch.arange(Wp, device=images.device)[None, :] < feat_w[:, None]  # (B, W')
@@ -264,18 +288,22 @@ class Im2LatexModel(nn.Module):
         c_i   = Attention(s_i, G)                           look at the image
         p_i   = softmax(W_o tanh(W_c [s_i; c_i]))           probabilities of the V tokens
     Start: s_0 = tanh(W_0 * mean(G)), c_0 = 0, y_0 = <start>.
+
+    dropout     = decoder dropout, just before W_o
+    enc_dropout = encoder dropout, after the row BiLSTM and on the final G
     """
 
-    def __init__(self, vocab_size, use_coverage=False, dropout=0.0,
+    def __init__(self, vocab_size, use_coverage=False, dropout=0.0, enc_dropout=0.0,
                  enc_hidden=128, emb_dim=256, dec_dim=256, att_dim=256):
         super().__init__()
         # Saved inside every checkpoint so predict.py can rebuild the same model.
         self.config = dict(vocab_size=vocab_size, use_coverage=use_coverage, dropout=dropout,
+                           enc_dropout=enc_dropout,
                            enc_hidden=enc_hidden, emb_dim=emb_dim, dec_dim=dec_dim,
                            att_dim=att_dim)
         self.use_coverage = use_coverage
 
-        self.encoder = Encoder(enc_hidden)
+        self.encoder = Encoder(enc_hidden, dropout=enc_dropout)
         enc_dim = self.encoder.out_dim                                  # 256
 
         self.embed = nn.Embedding(vocab_size, emb_dim, padding_idx=PAD)  # E(y): token -> vector
@@ -283,7 +311,7 @@ class Im2LatexModel(nn.Module):
         self.cell = nn.LSTMCell(emb_dim + enc_dim, dec_dim)             # decoder memory update
         self.attention = Attention(enc_dim, dec_dim, att_dim, use_coverage)
         self.W_c = nn.Linear(dec_dim + enc_dim, dec_dim)
-        self.dropout = nn.Dropout(dropout)                              # 0 = off (see tuning guide)
+        self.dropout = nn.Dropout(dropout)          # decoder dropout before W_o; 0 = off
         self.W_o = nn.Linear(dec_dim, vocab_size)                       # -> one score per token
 
     # -- helpers ------------------------------------------------------------------------
