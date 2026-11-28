@@ -42,6 +42,7 @@ INK_H = IMG_H - 2 * MARGIN   # height of the ink inside the input = 56 px
 DOWN = 8            # the CNN makes height and width 8x smaller (3 max-pools of 2)
 MAX_W = 1024        # widest input; wider expressions are squeezed sideways
 MIN_W = 16          # narrowest input, so even a lone "1" gives 2 feature columns
+PAD_TO = 32         # batch tensors are padded up to a multiple of this (px), see pad_images
 
 
 # ---- input preparation (shared by train.py and predict.py) -------------------------
@@ -106,14 +107,26 @@ def prepare_image(img, ink_white=None, augment=None):
     return to_model_input(mask)
 
 
+def round_up(n, k):
+    """Smallest multiple of k that is >= n."""
+    return -(-n // k) * k
+
+
 def pad_images(images):
-    """List of (1, 64, W_k) tensors -> one batch tensor (B, 1, 64, W_max) + widths.
+    """List of (1, 64, W_k) tensors -> one batch tensor (B, 1, 64, W_pad) + widths.
 
     Narrower images are filled up on the right with paper (0). `widths` tells
     the model where each real image ends, so it can ignore the filler.
+
+    W_pad = widest image rounded UP to a multiple of PAD_TO = 32 px: then only
+    a few different batch shapes occur, so the GPU can reuse the same memory
+    buffers from batch to batch instead of making new ones for every width.
+    The extra columns are filler like any other (widths stay the real widths).
+    The height is always IMG_H = 64, already a multiple of 32, so it is never
+    padded (the Encoder only masks filler COLUMNS, not rows).
     """
     widths = torch.tensor([im.shape[-1] for im in images], dtype=torch.long)
-    batch = torch.zeros(len(images), 1, IMG_H, int(widths.max()))
+    batch = torch.zeros(len(images), 1, IMG_H, round_up(int(widths.max()), PAD_TO))
     for k, im in enumerate(images):
         batch[k, :, :, :im.shape[-1]] = im
     return batch, widths
