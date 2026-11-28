@@ -43,10 +43,20 @@ Against overfitting (tuning guide in CNN_BiLSTM_Attention_Model.md):
     --dropout p        dropout in the decoder (before the output layer)
     augmentation       stroke width, slant, stretch, rotation, elastic warp, blur, specks
 
+Continuing from saved weights (--init): the model starts from the weights of a
+checkpoint instead of random ones. Only the weights are in best.pt, so Adam, the
+learning-rate schedule, early stopping and the epoch count start fresh. Use the
+same --coverage (and normally the same dropouts) as that run, and another --out,
+otherwise its best.pt / history.csv are overwritten at the end.
+
+Apple GPU (MPS): the memory PyTorch keeps cached is handed back to the system
+after the training part and after the evaluation part of every epoch.
+
 Usage (from the project root):
     python -m src.model.train                                  # full training
     python -m src.model.train --enc-dropout 0.5 --dropout 0.5  # with both dropouts
     python -m src.model.train --limit 64 --epochs 2 --batch 8 --train-eval-size 32  # quick test
+    python -m src.model.train --init outputs/model/best.pt --out outputs/model_continued
 """
 
 import argparse
@@ -391,6 +401,42 @@ def save_checkpoint(path, model, vocab, epoch, metrics):
     torch.save(ckpt, path)
 
 
+# config entries that decide the layer sizes; they must match for --init
+# (dropout may differ: it has no weights)
+SIZE_KEYS = ("vocab_size", "use_coverage", "enc_hidden", "emb_dim", "dec_dim", "att_dim")
+
+
+def load_init_weights(model, vocab, path):
+    """--init: copy the weights of a saved checkpoint into `model`.
+
+    Only the weights: a checkpoint holds no optimizer or learning-rate state.
+    Stops with a message if the checkpoint does not fit (other vocabulary,
+    other layer sizes, other CNN channels).
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    old = ckpt["config"]
+    if ckpt["vocab"] != vocab.itos:
+        raise SystemExit(f"--init {path}: its vocabulary differs from {VOCAB_PATH}")
+    diff = {k: (old.get(k), model.config[k]) for k in SIZE_KEYS if old.get(k) != model.config[k]}
+    if diff:
+        raise SystemExit(f"--init {path}: other model sizes, (checkpoint, now): {diff}")
+    try:
+        model.load_state_dict(ckpt["model"])        # copies onto the model's device
+    except RuntimeError as err:                     # e.g. other CNN_CHANNELS
+        raise SystemExit(f"--init {path}: the weights do not fit this model:\n{err}")
+    cer = (ckpt.get("metrics") or {}).get("valid", {}).get("cer")
+    print(f"Starting from {path}: epoch {ckpt.get('epoch')} of that run"
+          + (f", valid-subset CER {cer:.3f}" if cer is not None else "")
+          + f"; its dropout: encoder {old.get('enc_dropout', 0.0)}, decoder {old.get('dropout')}")
+
+
+def free_gpu_cache(device):
+    """Apple GPU (MPS) only: hand the memory PyTorch keeps cached back to the
+    system (on a Mac the GPU shares the normal RAM). Nothing on CUDA / CPU."""
+    if device.type == "mps":
+        torch.mps.empty_cache()
+
+
 HISTORY_FIELDS = ["epoch", "lr", "train_loss", "valid_loss",
                   "train_exprate", "train_le1", "train_le2", "train_cer", "train_token_acc",
                   "valid_exprate", "valid_le1", "valid_le2", "valid_cer", "valid_token_acc",
@@ -461,6 +507,9 @@ def parse_args(argv=None):
                     help="valid images (fixed random subset) decoded every epoch; 0 = all")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=str(OUT), help="folder for weights, history and plots")
+    ap.add_argument("--init", default=None,
+                    help="start from the weights of this checkpoint (e.g. outputs/model/best.pt) "
+                         "instead of random ones; optimizer and lr schedule start fresh")
     return ap.parse_args(argv)
 
 
@@ -528,6 +577,11 @@ def main(argv=None):
           f"coverage {args.coverage}")
     print(f"Dropout: encoder {args.enc_dropout} (row BiLSTM output + G) | "
           f"decoder {args.dropout} (before the output layer)")
+    if args.init:
+        if Path(args.init).resolve() == (out / "best.pt").resolve():
+            print(f"Note: --init is {args.init}, which this run overwrites at the end "
+                  f"(use another --out to keep it)")
+        load_init_weights(model, vocab, args.init)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     # Divide the learning rate by 10 when the valid CER stops going down.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -547,9 +601,11 @@ def main(argv=None):
             t0 = time.time()
             lr = optimizer.param_groups[0]["lr"]
             train_loss = train_one_epoch(model, train_loader, optimizer, device, len(vocab))
+            free_gpu_cache(device)                     # training part done
             valid_loss = eval_loss(model, valid_loader, device, len(vocab))
             train_m, _ = evaluate(model, train_eval_loader, vocab, device)   # fixed subset
             valid_m, _ = evaluate(model, valid_eval_loader, vocab, device)   # fixed subset
+            free_gpu_cache(device)                     # evaluation part done
             scheduler.step(valid_m["cer"])
 
             record = {"epoch": epoch, "lr": lr, "train_loss": train_loss,
@@ -601,7 +657,7 @@ def main(argv=None):
     save_history(history, out / "history.csv")
     plot_history(history, out / "accuracy_vs_epoch.png", best_epoch)
     with open(out / "test_results.json", "w") as fh:
-        json.dump({"best_epoch": best_epoch, "model_config": model.config,
+        json.dump({"best_epoch": best_epoch, "model_config": model.config, "init": args.init,
                    "train_subset": train_m, "valid": valid_m, "test": test_m}, fh, indent=2)
     with open(out / "test_predictions.tsv", "w", encoding="utf-8") as fh:
         fh.write("image\ttruth\tprediction\tedit_distance\n")

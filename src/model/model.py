@@ -59,6 +59,7 @@ MIN_H = 16          # smallest input height, so even a lone "-" gives 2 feature 
 MIN_W = 16          # smallest input width, so even a lone "1" gives 2 feature columns
 MAX_H = 192         # largest input height and width (multiples of 8); bigger
 MAX_W = 1024        # expressions are shrunk more than SCALE (shape kept) to fit
+PAD_TO = 32         # batch tensors are padded up to a multiple of this (px), see pad_images
 
 
 # ---- input preparation (shared by train.py and predict.py) -------------------------
@@ -159,15 +160,24 @@ def prepare_image(img, ink_white=None, augment=None):
 
 
 def pad_images(images):
-    """List of (1, H_k, W_k) tensors -> (batch (B, 1, H_max, W_max), widths (B,), heights (B,)).
+    """List of (1, H_k, W_k) tensors -> (batch (B, 1, H_pad, W_pad), widths (B,), heights (B,)).
 
     Every image sits in the top-left corner of the batch tensor; smaller images
     are filled up on the right AND at the bottom with paper (0). `widths` and
     `heights` tell the model where each real image ends, so it can ignore the filler.
+
+    H_pad / W_pad = tallest / widest image rounded UP to a multiple of
+    PAD_TO = 32 px: then only a few different batch shapes occur, so the GPU
+    can reuse the same memory buffers from batch to batch instead of making new
+    ones for every size. The extra rows / columns are filler like any other
+    (widths / heights stay the real sizes; the Encoder masks filler rows and
+    columns). MAX_H = 192 and MAX_W = 1024 are multiples of 32, so the
+    rounding never goes past them.
     """
     heights = torch.tensor([im.shape[-2] for im in images], dtype=torch.long)
     widths = torch.tensor([im.shape[-1] for im in images], dtype=torch.long)
-    batch = torch.zeros(len(images), 1, int(heights.max()), int(widths.max()))
+    batch = torch.zeros(len(images), 1, round_up(int(heights.max()), PAD_TO),
+                        round_up(int(widths.max()), PAD_TO))
     for k, im in enumerate(images):
         batch[k, :, :im.shape[-2], :im.shape[-1]] = im
     return batch, widths, heights
