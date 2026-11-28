@@ -10,6 +10,9 @@ What happens:
        compared (train much better than valid = overfitting, both bad = underfitting):
          - train on all train images (teacher forcing, random augmentation)
            -> train_loss
+           Batches hold images of similar size (sorted by height, then width;
+           the order of the batches is shuffled every epoch), so there is very
+           little padding. Valid / test batches are made the same way, unshuffled.
          - valid loss: same cross-entropy, teacher forcing, no augmentation
            -> valid_loss
          - greedy decoding (the model uses its own guesses) on FIXED random subsets
@@ -59,7 +62,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:          # allow `python src/model/train.py` / IDE Run button
@@ -70,8 +73,9 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")                  # draw plots into files, no window needed
 import matplotlib.pyplot as plt  # noqa: E402
 
-from src.model.model import (CNN_CHANNELS, Im2LatexModel, count_parameters,  # noqa: E402
-                             crop_to_ink, get_device, pad_images, prepare_image)
+from src.model.model import (CNN_CHANNELS, MAX_H, MAX_W, SCALE, Im2LatexModel,  # noqa: E402
+                             count_parameters, crop_to_ink, get_device, ink_mask, input_size,
+                             pad_images, prepare_image, shrink_factor)
 from src.model.vocab import DATA, PAD, VOCAB_PATH, Vocab, read_truth_tsv, tokenize  # noqa: E402
 
 OUT = ROOT / "outputs" / "model"
@@ -162,7 +166,7 @@ def augment_mask(mask):
 
 
 def augment_tensor(x):
-    """Random blur / specks on the final (1, 64, W) input (values 0..1)."""
+    """Random blur / specks on the final (1, H, W) input (values 0..1)."""
     # 6) blur: softer stroke edges
     if random.random() < 0.3:
         img = cv2.GaussianBlur(x[0].numpy(), (3, 3), random.uniform(0.5, 1.0))
@@ -180,34 +184,50 @@ def augment_tensor(x):
 class CrohmeDataset(Dataset):
     """One split of the rendered CROHME data.
 
-    item k -> (image tensor (1, 64, W), token indices <start> .. <end>, k)
+    item k -> (image tensor (1, H, W), token indices <start> .. <end>, k)
     The CROHME renders have DARK ink on white paper, so ink_white=False.
+
+    `items` holds (image path, true tokens, token indices, (H, W)) per image,
+    (H, W) = size of its model input without augmentation, measured once here
+    (reads every image, a few seconds) and used by SizeBatchSampler.
     """
 
     def __init__(self, split, vocab, train=False, limit=None, data=DATA):
         self.data = Path(data)
         self.train = train
-        self.items = []                     # (image path, true tokens, token indices)
+        items = []                          # (image path, true tokens, token indices)
         skipped = 0
         for image, latex in read_truth_tsv(split, data):
             tokens = tokenize(latex)
             if train and len(tokens) + 1 > MAX_LEN:    # too long to learn, leave out
                 skipped += 1
                 continue
-            self.items.append((image, tokens, vocab.encode(tokens)))
+            items.append((image, tokens, vocab.encode(tokens)))
         if limit:
-            self.items = self.items[:limit]
-        msg = f" ({skipped} longer than {MAX_LEN} tokens skipped)" if skipped else ""
-        print(f"{split}: {len(self.items)} expressions{msg}")
+            items = items[:limit]
+
+        self.items, shrunk = [], 0
+        for image, tokens, ids in items:
+            h, w = ink_mask(self.read(image), ink_white=False).shape   # ink crop size
+            shrunk += shrink_factor(h, w) < SCALE                       # hit the size cap
+            self.items.append((image, tokens, ids, input_size(h, w)))
+        msg = f", {skipped} longer than {MAX_LEN} tokens skipped" if skipped else ""
+        print(f"{split}: {len(self.items)} expressions ({shrunk} bigger than "
+              f"{MAX_H} x {MAX_W} px at x{SCALE}, shrunk more to fit{msg})")
+
+    def read(self, image):
+        """Image path (relative to the data folder) -> grayscale numpy image."""
+        img = cv2.imread(str(self.data / image), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(self.data / image)
+        return img
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, k):
-        image, _, ids = self.items[k]
-        img = cv2.imread(str(self.data / image), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(self.data / image)
+        image, _, ids, _ = self.items[k]
+        img = self.read(image)
         if self.train:
             x = augment_tensor(prepare_image(img, ink_white=False, augment=augment_mask))
         else:
@@ -218,15 +238,50 @@ class CrohmeDataset(Dataset):
 def collate(batch):
     """List of samples -> one batch.
 
-    Images are padded on the right with paper up to the widest image; token
-    lists are padded with <pad> up to the longest list (the loss ignores <pad>).
+    Images are padded with paper on the right up to the widest image and at
+    the bottom up to the tallest one (widths / heights say where each real
+    image ends); token lists are padded with <pad> up to the longest list (the
+    loss ignores <pad>).
     """
     images, ids, keys = zip(*batch)
-    x, widths = pad_images(images)
+    x, widths, heights = pad_images(images)
     tokens = torch.full((len(ids), max(len(t) for t in ids)), PAD, dtype=torch.long)
     for k, t in enumerate(ids):
         tokens[k, :len(t)] = t
-    return x, widths, tokens, torch.tensor(keys)
+    return x, widths, heights, tokens, torch.tensor(keys)
+
+
+class SizeBatchSampler(Sampler):
+    """Batches of images of similar size, so a batch needs very little padding.
+
+    The images are sorted by input height, then width, and the sorted list is
+    cut into batches of `batch_size` images.
+    shuffle=True (training): the ORDER OF THE BATCHES is random every epoch, and
+        images of exactly the same size are mixed differently every epoch, so
+        training stays random although every batch holds similar sizes.
+    shuffle=False (valid / test): always the same batches, smallest first.
+    (Training sizes are measured without augmentation; the random augmentation
+    changes them a little, so train batches still have a bit of padding.)
+    """
+
+    def __init__(self, sizes, batch_size, shuffle=False):
+        self.sizes = list(sizes)            # (H, W) of every image of the dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __len__(self):
+        return (len(self.sizes) + self.batch_size - 1) // self.batch_size   # number of batches
+
+    def __iter__(self):
+        n = len(self.sizes)
+        # Random start order when shuffling: sort() keeps it among equal sizes.
+        # (torch's random numbers, seeded in main())
+        order = torch.randperm(n).tolist() if self.shuffle else list(range(n))
+        order.sort(key=lambda k: self.sizes[k])                    # by height, then width
+        batches = [order[i:i + self.batch_size] for i in range(0, n, self.batch_size)]
+        if self.shuffle:
+            batches = [batches[i] for i in torch.randperm(len(batches)).tolist()]
+        return iter(batches)
 
 
 # ---- metrics --------------------------------------------------------------------------------
@@ -266,8 +321,8 @@ def evaluate(model, loader, vocab, device):
     model.eval()                                       # BatchNorm/dropout in test mode
     dataset = loader.dataset
     preds = {}
-    for x, widths, _, keys in loader:
-        out = model.greedy_decode(x.to(device), widths.to(device), MAX_LEN)
+    for x, widths, heights, _, keys in loader:
+        out = model.greedy_decode(x.to(device), widths.to(device), heights.to(device), MAX_LEN)
         for k, ids in zip(keys.tolist(), out.cpu().tolist()):
             preds[k] = vocab.decode(ids)               # indices -> tokens, cut at <end>
 
@@ -279,13 +334,13 @@ def evaluate(model, loader, vocab, device):
 
 
 # ---- loss: one training epoch, and the same loss on valid -------------------------------------------
-def batch_loss(model, x, widths, tokens, vocab_size):
+def batch_loss(model, x, widths, heights, tokens, vocab_size):
     """Cross-entropy of one batch with teacher forcing.
 
     Returns (mean loss per real token, number of real tokens).
     """
     # Teacher forcing: input = <start> y1 .. y_{L-1}, target = y1 .. y_L <end>
-    logits = model(x, widths, tokens[:, :-1])          # (B, T, V)
+    logits = model(x, widths, heights, tokens[:, :-1])  # (B, T, V)
     target = tokens[:, 1:]                             # (B, T)
     # Cross-entropy = -log(probability given to the right token), averaged
     # over all real tokens (<pad> positions are ignored).
@@ -298,9 +353,10 @@ def train_one_epoch(model, loader, optimizer, device, vocab_size, clip=5.0):
     """One pass over the training set. Returns the mean loss per token."""
     model.train()                                      # BatchNorm/dropout in training mode
     total_loss, total_tokens = 0.0, 0
-    for x, widths, tokens, _ in loader:
-        x, widths, tokens = x.to(device), widths.to(device), tokens.to(device)
-        loss, n = batch_loss(model, x, widths, tokens, vocab_size)
+    for x, widths, heights, tokens, _ in loader:
+        x, widths, heights = x.to(device), widths.to(device), heights.to(device)
+        tokens = tokens.to(device)
+        loss, n = batch_loss(model, x, widths, heights, tokens, vocab_size)
 
         optimizer.zero_grad()
         loss.backward()                                # gradients for CNN, BiLSTMs, attention, decoder
@@ -318,9 +374,10 @@ def eval_loss(model, loader, device, vocab_size):
     (the loader's dataset has train=False). Returns the mean loss per token."""
     model.eval()                                       # BatchNorm/dropout in test mode
     total_loss, total_tokens = 0.0, 0
-    for x, widths, tokens, _ in loader:
-        x, widths, tokens = x.to(device), widths.to(device), tokens.to(device)
-        loss, n = batch_loss(model, x, widths, tokens, vocab_size)
+    for x, widths, heights, tokens, _ in loader:
+        x, widths, heights = x.to(device), widths.to(device), heights.to(device)
+        tokens = tokens.to(device)
+        loss, n = batch_loss(model, x, widths, heights, tokens, vocab_size)
         total_loss += loss.item() * n
         total_tokens += n
     return total_loss / max(total_tokens, 1)
@@ -446,22 +503,29 @@ def main(argv=None):
     valid_eval_set.items = random.Random(args.seed).sample(valid_set.items, n_val)
     print(f"valid subset for metrics: {n_val} expressions (fixed)")
 
-    loader_kw = dict(collate_fn=collate, num_workers=args.workers,
-                     pin_memory=device.type == "cuda")
-    # shuffle=True: a new random order (and new augmentation) every epoch
-    train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True, **loader_kw)
-    train_eval_loader = DataLoader(train_eval_set, batch_size=args.eval_batch, shuffle=False,
-                                   **loader_kw)
-    valid_loader = DataLoader(valid_set, batch_size=args.eval_batch, shuffle=False, **loader_kw)
-    valid_eval_loader = DataLoader(valid_eval_set, batch_size=args.eval_batch, shuffle=False,
-                                   **loader_kw)
-    test_loader = DataLoader(test_set, batch_size=args.eval_batch, shuffle=False, **loader_kw)
+    def make_loader(dataset, batch_size, shuffle=False):
+        """Loader whose batches hold images of similar size (SizeBatchSampler).
+        The order of the images does not matter for the metrics: evaluate()
+        puts every prediction back at its image's index."""
+        sizes = [item[3] for item in dataset.items]
+        return DataLoader(dataset, batch_sampler=SizeBatchSampler(sizes, batch_size, shuffle),
+                          collate_fn=collate, num_workers=args.workers,
+                          pin_memory=device.type == "cuda")
+
+    # shuffle=True: a new random batch order (and new augmentation) every epoch
+    train_loader = make_loader(train_set, args.batch, shuffle=True)
+    train_eval_loader = make_loader(train_eval_set, args.eval_batch)
+    valid_loader = make_loader(valid_set, args.eval_batch)
+    valid_eval_loader = make_loader(valid_eval_set, args.eval_batch)
+    test_loader = make_loader(test_set, args.eval_batch)
 
     # 3) Model, optimizer, learning-rate schedule
     model = Im2LatexModel(len(vocab), use_coverage=args.coverage, dropout=args.dropout,
                           enc_dropout=args.enc_dropout).to(device)
     print(f"Model: {count_parameters(model) / 1e6:.2f} M parameters | "
-          f"CNN channels {'-'.join(map(str, CNN_CHANNELS))} | coverage {args.coverage}")
+          f"CNN channels {'-'.join(map(str, CNN_CHANNELS))} | "
+          f"embedding {model.config['emb_dim']}, decoder memory {model.config['dec_dim']} | "
+          f"coverage {args.coverage}")
     print(f"Dropout: encoder {args.enc_dropout} (row BiLSTM output + G) | "
           f"decoder {args.dropout} (before the output layer)")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)

@@ -54,15 +54,15 @@ def load_model(weights=DEFAULT_WEIGHTS, device=None):
 def predict_crops(model, vocab, crops, ink_white=True, batch_size=16, max_len=MAX_LEN):
     """List of images (numpy) -> list of LaTeX strings, same order.
 
-    Images are prepared exactly like in training (crop to ink, height 64)
+    Images are prepared exactly like in training (crop to ink, shrink by SCALE = 0.5)
     and read in batches of `batch_size`.
     """
     device = next(model.parameters()).device
     inputs = [prepare_image(c, ink_white) for c in crops]
     latex = []
     for b in range(0, len(inputs), batch_size):
-        x, widths = pad_images(inputs[b:b + batch_size])
-        out = model.greedy_decode(x.to(device), widths.to(device), max_len)
+        x, widths, heights = pad_images(inputs[b:b + batch_size])
+        out = model.greedy_decode(x.to(device), widths.to(device), heights.to(device), max_len)
         latex += [to_latex(vocab.decode(ids)) for ids in out.cpu().tolist()]
     return latex
 

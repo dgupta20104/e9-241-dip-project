@@ -2,13 +2,16 @@
 
 Design: Claude Chat Memory/CNN_BiLSTM_Attention_Model.md
 
-    line image (1 x 64 x W)
-      -> CNN                       -> 256 x 8 x W/8    (a grid of feature vectors)
-      -> row BiLSTM (along W')     -> 256 x 8 x W/8    (each vector now knows its left/right)
-      -> column BiLSTM (along H')  -> 256 x 8 x W/8    (... and what is above/below) = G
+    line image (1 x H x W)         H, W vary per image (both multiples of 8)
+      -> CNN                       -> 128 x H/8 x W/8  (a grid of feature vectors)
+      -> row BiLSTM (along W')     -> 256 x H/8 x W/8  (each vector now knows its left/right)
+      -> column BiLSTM (along H')  -> 256 x H/8 x W/8  (... and what is above/below) = G
       -> 2-D attention + LSTM decoder, one token per step until <end>
 
-CNN channels: 32 -> 64 -> 128 -> 256, as in the spec (CNN_CHANNELS).
+Sizes, both HALF of the spec, to make training faster:
+    CNN channels: 16 -> 32 -> 64 -> 128 (spec: 32 -> 64 -> 128 -> 256), CNN_CHANNELS
+    decoder: embedding size and decoder memory size 128 (spec: 256), emb_dim / dec_dim
+Checkpoints trained with the spec's sizes no longer fit this model.
 
 Dropout (randomly zeroes values during training only; off in model.eval()):
     enc_dropout: in the encoder, on the row-BiLSTM output and on the final grid G
@@ -18,13 +21,26 @@ Dropout (randomly zeroes values during training only; off in model.eval()):
 This file also holds the input preparation (`prepare_image`) that training
 AND prediction both use, so the model always sees images made the same way:
 
-    any image -> binary mask (ink = 255) -> crop to the ink -> resize so the ink
-    is 56 px high -> 4 px empty margin on every side (height 64) -> width rounded
-    up to a multiple of 8 -> float tensor (1, 64, W), ink = 1.0, paper = 0.0
+    any image -> binary mask (ink = 255) -> crop to the ink -> shrink by the
+    constant factor SCALE = 0.5 in both directions (shape kept) -> 4 px empty
+    margin on every side -> extra paper at the bottom and on the right so that
+    height and width are multiples of 8 -> float tensor (1, H, W), ink = 1.0, paper = 0.0
+
+    Size cap: the input is at most MAX_H x MAX_W = 192 x 1024 px. The rare
+    expression that would be bigger at x0.5 (~1 % of train) is shrunk a bit
+    more, same factor in both directions, so it just fits. This keeps single
+    huge images from blowing up a whole batch.
+
+Why a constant scale (and not a fixed ink height): every CROHME render already
+has the same symbol size (median symbol 48 px, src/model/data_prep.py), so after
+x0.5 a symbol is ~24 px in EVERY input. A tall expression (a fraction) gives a
+taller input instead of smaller symbols. So H differs between images, and in a
+batch the shorter images are padded at the bottom (see pad_images / Encoder).
 
 Shapes used in the comments:
-    B = batch size, W = image width, H' = 8 and W' = W/8 = size of the CNN output grid,
-    N = H' * W' = number of grid positions, T = number of decoder steps, V = vocab size.
+    B = batch size, H, W = image height and width, H' = H/8 and W' = W/8 = size of
+    the CNN output grid, N = H' * W' = number of grid positions,
+    T = number of decoder steps, V = vocab size.
 """
 
 import cv2
@@ -36,12 +52,13 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from src.model.vocab import END, PAD, START
 
 # ---- input size -----------------------------------------------------------------
-IMG_H = 64          # height of every model input (px)
+SCALE = 0.5         # every image is shrunk by this same factor (no fixed height)
 MARGIN = 4          # empty paper border around the ink (px)
-INK_H = IMG_H - 2 * MARGIN   # height of the ink inside the input = 56 px
 DOWN = 8            # the CNN makes height and width 8x smaller (3 max-pools of 2)
-MAX_W = 1024        # widest input; wider expressions are squeezed sideways
-MIN_W = 16          # narrowest input, so even a lone "1" gives 2 feature columns
+MIN_H = 16          # smallest input height, so even a lone "-" gives 2 feature rows
+MIN_W = 16          # smallest input width, so even a lone "1" gives 2 feature columns
+MAX_H = 192         # largest input height and width (multiples of 8); bigger
+MAX_W = 1024        # expressions are shrunk more than SCALE (shape kept) to fit
 
 
 # ---- input preparation (shared by train.py and predict.py) -------------------------
@@ -74,28 +91,63 @@ def ink_mask(img, ink_white=None):
     return crop_to_ink(mask.astype(np.uint8))
 
 
-def to_model_input(mask):
-    """Cropped binary mask (ink = 255) -> float tensor (1, 64, W) with ink = 1.0."""
-    h, w = mask.shape
-    # Keep the shape (aspect ratio): the ink becomes INK_H px high, the width follows.
-    new_w = int(round(w * INK_H / h))
-    new_w = min(max(new_w, MIN_W - 2 * MARGIN), MAX_W - 2 * MARGIN)
-    # INTER_AREA is the best way to shrink; INTER_LINEAR to enlarge.
-    interp = cv2.INTER_AREA if h > INK_H else cv2.INTER_LINEAR
-    small = cv2.resize(mask, (new_w, INK_H), interpolation=interp)
+def round_up(n, k):
+    """Smallest multiple of k that is >= n."""
+    return -(-n // k) * k
 
-    # Paper margin on every side, plus extra paper on the right so that the
-    # width is a multiple of 8 (then every CNN output column is pure image).
-    total_w = new_w + 2 * MARGIN
-    extra = (-total_w) % DOWN
-    small = cv2.copyMakeBorder(small, MARGIN, MARGIN, MARGIN, MARGIN + extra,
+
+def shrink_factor(h, w):
+    """Factor by which an ink crop of h x w px is shrunk: SCALE, or a bit less
+    for the rare crop that would otherwise not fit into MAX_H x MAX_W."""
+    return min(SCALE, (MAX_H - 2 * MARGIN) / h, (MAX_W - 2 * MARGIN) / w)
+
+
+def ink_size(h, w):
+    """Ink crop of h x w px -> size (h, w) of the ink after shrinking."""
+    s = shrink_factor(h, w)                     # same factor both ways: shape kept
+    new_h = min(max(1, int(round(h * s))), MAX_H - 2 * MARGIN)
+    new_w = min(max(1, int(round(w * s))), MAX_W - 2 * MARGIN)
+    return new_h, new_w
+
+
+def input_size(h, w):
+    """Ink crop of h x w px -> size (H, W) of the model input made from it.
+
+    Ink + paper margin on every side, plus extra paper at the bottom and on
+    the right so that H and W are multiples of 8 (then every CNN output cell is
+    pure image) and at least MIN_H x MIN_W (tiny inputs get more paper, the ink
+    itself is never stretched). train.py uses this to put images of similar
+    size into the same batch without preparing them first.
+    """
+    new_h, new_w = ink_size(h, w)
+    return (round_up(max(new_h + 2 * MARGIN, MIN_H), DOWN),
+            round_up(max(new_w + 2 * MARGIN, MIN_W), DOWN))
+
+
+def to_model_input(mask):
+    """Cropped binary mask (ink = 255) -> float tensor (1, H, W) with ink = 1.0.
+
+    Both directions are multiplied by the same factor (SCALE, less only if the
+    input would be bigger than MAX_H x MAX_W), so the shape is kept and H, W
+    follow from the size of the ink (bigger expression -> bigger input).
+    """
+    h, w = mask.shape
+    new_h, new_w = ink_size(h, w)
+    # INTER_AREA is the best way to shrink; INTER_LINEAR to enlarge.
+    interp = cv2.INTER_AREA if new_h <= h else cv2.INTER_LINEAR
+    small = cv2.resize(mask, (new_w, new_h), interpolation=interp)
+
+    # Paper margin + extra paper at the bottom and on the right (see input_size).
+    full_h, full_w = input_size(h, w)
+    small = cv2.copyMakeBorder(small, MARGIN, full_h - new_h - MARGIN,     # top, bottom
+                               MARGIN, full_w - new_w - MARGIN,            # left, right
                                cv2.BORDER_CONSTANT, value=0)
-    # uint8 0..255 -> float 0..1, and add the channel axis: (64, W) -> (1, 64, W)
+    # uint8 0..255 -> float 0..1, and add the channel axis: (H, W) -> (1, H, W)
     return torch.from_numpy(small.astype(np.float32) / 255.0).unsqueeze(0)
 
 
 def prepare_image(img, ink_white=None, augment=None):
-    """Image (numpy, any size) -> model input tensor (1, 64, W).
+    """Image (numpy, any size) -> model input tensor (1, H, W).
 
     `augment` (training only) is a function mask -> mask that randomly
     changes the cropped binary mask before it is resized.
@@ -107,16 +159,18 @@ def prepare_image(img, ink_white=None, augment=None):
 
 
 def pad_images(images):
-    """List of (1, 64, W_k) tensors -> one batch tensor (B, 1, 64, W_max) + widths.
+    """List of (1, H_k, W_k) tensors -> (batch (B, 1, H_max, W_max), widths (B,), heights (B,)).
 
-    Narrower images are filled up on the right with paper (0). `widths` tells
-    the model where each real image ends, so it can ignore the filler.
+    Every image sits in the top-left corner of the batch tensor; smaller images
+    are filled up on the right AND at the bottom with paper (0). `widths` and
+    `heights` tell the model where each real image ends, so it can ignore the filler.
     """
+    heights = torch.tensor([im.shape[-2] for im in images], dtype=torch.long)
     widths = torch.tensor([im.shape[-1] for im in images], dtype=torch.long)
-    batch = torch.zeros(len(images), 1, IMG_H, int(widths.max()))
+    batch = torch.zeros(len(images), 1, int(heights.max()), int(widths.max()))
     for k, im in enumerate(images):
-        batch[k, :, :, :im.shape[-1]] = im
-    return batch, widths
+        batch[k, :, :im.shape[-2], :im.shape[-1]] = im
+    return batch, widths, heights
 
 
 def get_device(name=None, verbose=False):
@@ -154,11 +208,11 @@ def conv_bn_relu(c_in, c_out):
     )
 
 
-CNN_CHANNELS = (32, 64, 128, 256)   # channels of blocks 1-4 (as in the spec)
+CNN_CHANNELS = (16, 32, 64, 128)   # channels of blocks 1-4 (half of the spec's 32, 64, 128, 256)
 
 
 class CNN(nn.Module):
-    """(B, 1, 64, W) -> (B, 256, 8, W/8). Channels double while the size halves.
+    """(B, 1, H, W) -> (B, 128, H/8, W/8). Channels double while the size halves.
 
     Receptive field: one output vector "sees" a 62 x 62 px patch of the input,
     about one symbol plus its neighbours.
@@ -168,11 +222,11 @@ class CNN(nn.Module):
         super().__init__()
         c1, c2, c3, c4 = CNN_CHANNELS
         self.layers = nn.Sequential(
-            conv_bn_relu(1, c1), nn.MaxPool2d(2),        # block 1 -> c1 x 32 x W/2
-            conv_bn_relu(c1, c2), nn.MaxPool2d(2),       # block 2 -> c2 x 16 x W/4
+            conv_bn_relu(1, c1), nn.MaxPool2d(2),        # block 1 -> c1 x H/2 x W/2
+            conv_bn_relu(c1, c2), nn.MaxPool2d(2),       # block 2 -> c2 x H/4 x W/4
             conv_bn_relu(c2, c3), conv_bn_relu(c3, c3),
-            nn.MaxPool2d(2),                             # block 3 -> c3 x 8 x W/8
-            conv_bn_relu(c3, c4), conv_bn_relu(c4, c4),  # block 4 -> c4 x 8 x W/8
+            nn.MaxPool2d(2),                             # block 3 -> c3 x H/8 x W/8
+            conv_bn_relu(c3, c4), conv_bn_relu(c4, c4),  # block 4 -> c4 x H/8 x W/8
         )
         self.out_channels = c4                           # values per grid vector
 
@@ -192,6 +246,11 @@ class Encoder(nn.Module):
     Dropout (training only) is applied twice: on the row-BiLSTM output (what
     the column BiLSTM reads) and on the final grid G (what the attention and
     the decoder's start state read). Not inside the CNN.
+
+    Batch padding: images in a batch have different sizes, so the smaller ones
+    are filled with paper on the right (fake columns) and at the bottom (fake
+    rows). Both BiLSTMs get each image's real length ("packing"), and the mask
+    marks fake rows and columns, so the attention never looks there.
     """
 
     def __init__(self, hidden=128, dropout=0.0):
@@ -205,16 +264,17 @@ class Encoder(nn.Module):
         self.drop = nn.Dropout(dropout)                  # 0 = off
         self.out_dim = 2 * hidden
 
-    def forward(self, images, widths):
-        """images (B, 1, 64, W), widths (B,) real image widths in px.
+    def forward(self, images, widths, heights):
+        """images (B, 1, H, W), widths / heights (B,) real image widths / heights in px.
 
         Returns G (B, N, 256), mask (B, N) True where the position is real
-        image (False = filler on the right), and the grid size (H', W').
+        image (False = filler on the right or at the bottom), and the grid size (H', W').
         """
         feat = self.cnn(images)                                  # (B, C, H', W')
         B, C, Hp, Wp = feat.shape
-        # How many grid columns of each image are real (not filler).
+        # How many grid columns / rows of each image are real (not filler).
         feat_w = (widths // DOWN).clamp(1, Wp)                   # (B,)
+        feat_h = (heights // DOWN).clamp(1, Hp)                  # (B,)
 
         # --- row BiLSTM: every row of every image is one sequence of W' vectors
         x = feat.permute(0, 2, 3, 1).reshape(B * Hp, Wp, C)     # (B*H', W', C)
@@ -228,18 +288,28 @@ class Encoder(nn.Module):
         x = self.drop(x)                                         # encoder dropout (a)
 
         # --- column BiLSTM: every column is one sequence of H' vectors
+        # (rows that are filler at the bottom were also read by the row BiLSTM;
+        # that is harmless, because the column BiLSTM below never reads them)
         x = x.reshape(B, Hp, Wp, -1).permute(0, 2, 1, 3)         # (B, W', H', 2d)
         x = x.reshape(B * Wp, Hp, -1)                            # (B*W', H', 2d)
-        x, _ = self.col_lstm(x)                                  # (B*W', H', 2d)
+        col_len = feat_h.repeat_interleave(Wp)                   # length of each column sequence
+        # Packing again, now for the height: the bottom->top pass starts at
+        # the image's real last row and never reads the filler rows below it.
+        packed = pack_padded_sequence(x, col_len.cpu(), batch_first=True,
+                                      enforce_sorted=False)
+        out, _ = self.col_lstm(packed)
+        x, _ = pad_packed_sequence(out, batch_first=True, total_length=Hp)  # (B*W', H', 2d)
 
         # --- back to one list of N = H' * W' vectors per image (row by row)
         G = x.reshape(B, Wp, Hp, -1).permute(0, 2, 1, 3)         # (B, H', W', 2d)
         G = G.reshape(B, Hp * Wp, -1)                            # (B, N, 2d)
         G = self.drop(G)            # encoder dropout (b): attention and s_0 both see this G
 
-        # mask[b, n] = True if position n of image b lies inside the real image
+        # mask[b, n] = True if position n of image b lies inside the real image:
+        # its column is a real column AND its row is a real row
         col_ok = torch.arange(Wp, device=images.device)[None, :] < feat_w[:, None]  # (B, W')
-        mask = col_ok[:, None, :].expand(B, Hp, Wp).reshape(B, Hp * Wp)
+        row_ok = torch.arange(Hp, device=images.device)[None, :] < feat_h[:, None]  # (B, H')
+        mask = (row_ok[:, :, None] & col_ok[:, None, :]).reshape(B, Hp * Wp)       # (B, N), row by row like G
         return G, mask, (Hp, Wp)
 
 
@@ -255,7 +325,7 @@ class Attention(nn.Module):
     earlier steps; it helps the model not to read a symbol twice or skip one.
     """
 
-    def __init__(self, enc_dim=256, dec_dim=256, att_dim=256, use_coverage=False):
+    def __init__(self, enc_dim=256, dec_dim=128, att_dim=256, use_coverage=False):
         super().__init__()
         self.W_s = nn.Linear(dec_dim, att_dim, bias=False)   # decoder memory -> att space
         self.W_g = nn.Linear(enc_dim, att_dim)               # grid vector    -> att space
@@ -291,7 +361,7 @@ class Im2LatexModel(nn.Module):
     """
 
     def __init__(self, vocab_size, use_coverage=False, dropout=0.0, enc_dropout=0.0,
-                 enc_hidden=128, emb_dim=256, dec_dim=256, att_dim=256):
+                 enc_hidden=128, emb_dim=128, dec_dim=128, att_dim=256):
         super().__init__()
         # Saved inside every checkpoint so predict.py can rebuild the same model.
         self.config = dict(vocab_size=vocab_size, use_coverage=use_coverage, dropout=dropout,
@@ -334,14 +404,15 @@ class Im2LatexModel(nn.Module):
         return logits, s, cell_mem, context, coverage, alpha
 
     # -- training: teacher forcing --------------------------------------------------------
-    def forward(self, images, widths, tokens_in):
-        """images (B, 1, 64, W), widths (B,), tokens_in (B, T) = <start> y_1 .. y_{T-1}.
+    def forward(self, images, widths, heights, tokens_in):
+        """images (B, 1, H, W), widths (B,), heights (B,),
+        tokens_in (B, T) = <start> y_1 .. y_{T-1}.
 
         Teacher forcing: at every step the decoder gets the TRUE previous
         token (not its own guess), so all steps can be trained at once.
         Returns logits (B, T, V): scores for the token at each step.
         """
-        G, mask, _ = self.encoder(images, widths)
+        G, mask, _ = self.encoder(images, widths, heights)
         G_proj = self.attention.W_g(G)                               # same for every step
         s, cell_mem, context, coverage = self._start_state(G, mask)
 
@@ -354,16 +425,17 @@ class Im2LatexModel(nn.Module):
 
     # -- prediction: greedy decoding ---------------------------------------------------------
     @torch.no_grad()
-    def greedy_decode(self, images, widths, max_len=150, return_attention=False):
+    def greedy_decode(self, images, widths, heights, max_len=150, return_attention=False):
         """Read a batch of images; at every step take the most likely token and
         feed it back in as the next input, until every image has produced <end>
         (or max_len steps).
 
         Returns token indices (B, T) (everything after <end> is junk, cut it with
         Vocab.decode) and, with return_attention=True, also the attention maps
-        (B, T, H', W'): where the model looked for each token (report heat maps).
+        (B, T, H', W'): where the model looked for each token (report heat maps;
+        fake rows / columns of padded images are 0 there).
         """
-        G, mask, (Hp, Wp) = self.encoder(images, widths)
+        G, mask, (Hp, Wp) = self.encoder(images, widths, heights)
         G_proj = self.attention.W_g(G)
         s, cell_mem, context, coverage = self._start_state(G, mask)
 
